@@ -13,6 +13,12 @@ This repository ships:
 Quick start
 -----------
 
+Python version support
+----------------------
+
+This project is tested to run on Python 3.9 through 3.12.
+For the best compatibility with current dependencies, we recommend Python 3.12.
+
 Install locally:
 
 .. code-block:: console
