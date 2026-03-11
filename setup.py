@@ -3,8 +3,10 @@
 """The setup script."""
 
 import os
-import rts_package as module
-from setuptools import setup, find_packages
+
+from setuptools import find_packages, setup
+
+import nuxnet_package as module
 
 
 def walker(base, *paths):
@@ -14,66 +16,59 @@ def walker(base, *paths):
     os.chdir(base)
     try:
         for path in paths:
-            for dname, dirs, files in os.walk(path):
-                for f in files:
-                    file_list.add(os.path.join(dname, f))
+            for dname, _dirs, files in os.walk(path):
+                for filename in files:
+                    file_list.add(os.path.join(dname, filename))
     finally:
         os.chdir(cur_dir)
 
     return list(file_list)
 
 
-with open('README.rst') as readme_file:
+with open('README.rst', encoding='utf-8') as readme_file:
     readme = readme_file.read()
 
-with open('CHANGELOG.rst') as history_file:
+with open('CHANGELOG.rst', encoding='utf-8') as history_file:
     history = history_file.read()
 
-with open('requirements.txt') as f:
-    requirements = f.read().splitlines()
-
-setup_requirements = 'pytest-runner'
-
-test_requirements = 'pytest'
+with open('requirements.txt', encoding='utf-8') as req_file:
+    requirements = req_file.read().splitlines()
 
 setup(
-    author="Julian Wanner",
-    author_email='jwgithub@mailbox.org',
-    python_requires='>=3.7',
+    author='NuxNet contributors',
+    author_email='noreply@example.org',
+    python_requires='>=3.9',
     classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
-        'Intended Audience :: Developers',
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Science/Research',
         'License :: OSI Approved :: MIT License',
         'Natural Language :: English',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
     ],
-    description="An mlf-core prediction package for root tissue segmentation.",
+    description='NuxNet 3D nuclei segmentation inference scaffold package.',
     entry_points={
         'console_scripts': [
-            'rts-pred=rts_package.cli_pred:main',
-            'rts-pred-uncert=rts_package.cli_uncert_pred:main',
-            'rts-feat-imp=rts_package.cli_feat_imp:main',
+            'nuxnet-pred=nuxnet_package.cli_pred:main',
         ],
     },
     install_requires=requirements,
-    license="MIT",
+    license='MIT',
     long_description=readme + '\n\n' + history,
     include_package_data=True,
-    keywords='root tissue segmentation',
-    name='root-tissue-seg-package',
-    packages=find_packages(include=['rts_package', 'rts_package.*']),
+    keywords='nuclei segmentation inference 3d unet',
+    name='nuxnet-inference',
+    packages=find_packages(include=['nuxnet_package', 'nuxnet_package.*']),
     package_data={
         module.__name__: walker(
             os.path.dirname(module.__file__),
-            'models', 'data'
+            'models',
+            'data',
         ),
     },
-    setup_requires=setup_requirements,
-    tests_require=test_requirements,
-    url='https://github.com/qbic-pipelines/rts-prediction-package/',
-    version='1.0.7',
+    url='https://github.com/nuxnet/nuxnet-inference',
+    version='2.0.0',
     zip_safe=False,
 )

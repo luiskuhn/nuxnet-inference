@@ -48,7 +48,7 @@ clean-test: ## remove test and coverage artifacts
 	rm -fr .pytest_cache
 
 lint: ## check style with flake8
-	flake8 rts_package tests
+	flake8 nuxnet_package tests
 
 test: ## run tests quickly with the default Python
 	pytest
@@ -57,15 +57,15 @@ test-all: ## run tests on every Python version with tox
 	tox
 
 coverage: ## check code coverage quickly with the default Python
-	coverage run --source rts_package -m pytest
+	coverage run --source nuxnet_package -m pytest
 	coverage report -m
 	coverage html
 	$(BROWSER) htmlcov/index.html
 
 docs: ## generate Sphinx HTML documentation, including API docs
-	rm -f docs/rts_package.rst
+	rm -f docs/nuxnet_package.rst
 	rm -f docs/modules.rst
-	sphinx-apidoc -o docs/ rts_package
+	sphinx-apidoc -o docs/ nuxnet_package
 	$(MAKE) -C docs clean
 	$(MAKE) -C docs html
 	$(BROWSER) docs/_build/html/index.html

@@ -4,7 +4,7 @@
 # You can set these variables from the command line.
 SPHINXOPTS    =
 SPHINXBUILD   = python -msphinx
-SPHINXPROJ    = rts_package
+SPHINXPROJ    = nuxnet_inference
 SOURCEDIR     = .
 BUILDDIR      = _build
 
