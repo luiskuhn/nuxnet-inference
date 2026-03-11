@@ -9,6 +9,8 @@ import torch
 from rich import print, traceback
 from torch import nn
 
+from nuxnet_inference_package.models.unet3d import UNet3D
+
 
 class DummyNuxNet3D(nn.Module):
     """Minimal 3D segmentation network for CPU smoke testing."""
@@ -34,8 +36,23 @@ def parse_shape(shape: str) -> tuple[int, int, int]:
     return dims
 
 
-def initialize_model(model_path: str | None, classes: int, device: torch.device) -> nn.Module:
-    model = DummyNuxNet3D(classes=classes)
+def build_model(arch: str, in_channels: int, classes: int, dropout_rate: float) -> nn.Module:
+    if arch == "dummy":
+        return DummyNuxNet3D(in_channels=in_channels, classes=classes)
+    if arch == "unet3d":
+        return UNet3D(in_channels=in_channels, classes=classes, dropout=dropout_rate)
+    raise click.ClickException(f"Unsupported architecture: {arch}")
+
+
+def initialize_model(
+    model_path: str | None,
+    arch: str,
+    in_channels: int,
+    classes: int,
+    dropout_rate: float,
+    device: torch.device,
+) -> nn.Module:
+    model = build_model(arch=arch, in_channels=in_channels, classes=classes, dropout_rate=dropout_rate)
     if model_path:
         state = torch.load(model_path, map_location="cpu")
         model.load_state_dict(state.get("state_dict", state))
@@ -104,18 +121,39 @@ def write_results(prediction: np.ndarray, output_prefix: Path) -> None:
 @click.option("-m", "--model", required=False, type=str, help="Optional path to a .pt checkpoint (state_dict).")
 @click.option("-o", "--output", default="predictions", required=True, type=str, help="Output path prefix or folder.")
 @click.option("--shape", default="16,64,64", show_default=True, type=str, help="Dummy input shape as D,H,W when --input is omitted.")
+@click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Inference model architecture.")
 @click.option("--classes", default=3, show_default=True, type=int, help="Number of output classes.")
+@click.option("--in-channels", default=1, show_default=True, type=int, help="Number of input channels expected by model.")
+@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout used by UNet3D blocks.")
 @click.option("--seed", default=42, show_default=True, type=int, help="RNG seed for dummy input and model init.")
 @click.option("-c/-nc", "--cuda/--no-cuda", type=bool, default=False, help="Run on CUDA if available.")
-def main(input: str | None, model: str | None, output: str, shape: str, classes: int, seed: int, cuda: bool) -> None:
+def main(
+    input: str | None,
+    model: str | None,
+    output: str,
+    shape: str,
+    arch: str,
+    classes: int,
+    in_channels: int,
+    dropout_rate: float,
+    seed: int,
+    cuda: bool,
+) -> None:
     """Run 3D segmentation inference (nuxnet-pred)."""
-    print("[bold blue]nuxnet-pred (3D scaffold mode)")
+    print("[bold blue]nuxnet-pred")
 
     np.random.seed(seed)
     torch.manual_seed(seed)
     device = torch.device("cuda" if cuda and torch.cuda.is_available() else "cpu")
 
-    model_3d = initialize_model(model_path=model, classes=classes, device=device)
+    model_3d = initialize_model(
+        model_path=model,
+        arch=arch,
+        in_channels=in_channels,
+        classes=classes,
+        dropout_rate=dropout_rate,
+        device=device,
+    )
 
     for input_file in iter_inputs(input):
         output_prefix = output_prefix_for(input_file=input_file, input_root=input, output=output)
