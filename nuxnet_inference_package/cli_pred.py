@@ -4,13 +4,77 @@ from pathlib import Path
 from typing import Iterable
 
 import click
+import networkx as nx
 import numpy as np
 import torch
 from rich import print, traceback
+from scipy.spatial import KDTree
+from skimage import exposure, measure
 from tifffile import TiffFile, imwrite
 from torch import nn
 
 from nuxnet_inference_package.models.unet3d import UNet3D
+
+
+def extract_nuclei_instances(
+    prediction: np.ndarray,
+    nuclei_label: int,
+    radius: float = 2.0,
+) -> list[dict[str, float | int]]:
+    """Cluster nuclei voxels via KDTree-neighborhood graph and return centroid/size per cluster."""
+    if prediction.ndim != 3:
+        raise click.ClickException(f"Expected prediction with shape (D,H,W), got shape {prediction.shape}")
+
+    nuclei_mask = prediction == nuclei_label
+    labeled_mask = measure.label(nuclei_mask.astype(np.uint8), background=0, connectivity=1)
+    foreground_coords = np.argwhere(labeled_mask > 0)
+
+    if foreground_coords.size == 0:
+        return []
+
+    tree = KDTree(foreground_coords)
+    graph = nx.DiGraph()
+    graph.add_nodes_from(range(len(foreground_coords)))
+
+    for node_index, coord in enumerate(foreground_coords):
+        neighbors = tree.query_ball_point(coord, r=radius)
+        for neighbor_index in neighbors:
+            if neighbor_index == node_index:
+                continue
+            graph.add_edge(node_index, neighbor_index)
+
+    components = sorted(nx.strongly_connected_components(graph), key=lambda comp: min(comp))
+    nuclei_instances = []
+
+    for nuclei_id, component in enumerate(components, start=1):
+        component_indices = np.fromiter(component, dtype=int)
+        component_coords = foreground_coords[component_indices]
+        centroid_z, centroid_y, centroid_x = component_coords.mean(axis=0)
+        nuclei_instances.append(
+            {
+                "id": nuclei_id,
+                "z": float(centroid_z),
+                "y": float(centroid_y),
+                "x": float(centroid_x),
+                "size_voxels": int(component_coords.shape[0]),
+            }
+        )
+
+    return nuclei_instances
+
+
+def write_instances_tsv(instances: list[dict[str, float | int]], output_prefix: Path) -> Path:
+    output_path = output_prefix.with_suffix(".nuclei.tsv")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        file.write("id\tz\ty\tx\tsize_voxels\n")
+        for instance in instances:
+            file.write(
+                f"{instance['id']}\t{instance['z']:.3f}\t{instance['y']:.3f}\t{instance['x']:.3f}\t{instance['size_voxels']}\n"
+            )
+
+    print(f"[bold green]Nuclei table: {output_path}")
+    return output_path
 
 
 class DummyNuxNet3D(nn.Module):
@@ -108,8 +172,22 @@ def read_input_or_dummy(file_path: Path | None, shape: str) -> np.ndarray:
     return volume
 
 
-def predict_volume(volume: np.ndarray, model: nn.Module, device: torch.device) -> np.ndarray:
-    tensor = torch.from_numpy(volume[None, None, ...]).float().to(device)
+def predict_volume(
+    volume: np.ndarray,
+    model: nn.Module,
+    device: torch.device,
+    normalize_input: bool,
+) -> np.ndarray:
+    if normalize_input:
+        model_input = exposure.rescale_intensity(
+            volume,
+            in_range=(float(volume.min()), float(volume.max())),
+            out_range=(0.0, 1.0),
+        ).astype(np.float32)
+    else:
+        model_input = volume.astype(np.float32)
+
+    tensor = torch.from_numpy(model_input[None, None, ...]).float().to(device)
     with torch.no_grad():
         logits = model(tensor)
     return torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
@@ -164,6 +242,10 @@ def run_inference(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    normalize_input: bool,
+    postprocess_instances: bool,
+    nuclei_label: int,
+    neighbor_radius: float,
 ) -> None:
     print("[bold blue]nuxnet-pred")
     np.random.seed(seed)
@@ -182,8 +264,15 @@ def run_inference(
     for input_file in iter_inputs(input_path):
         output_prefix = output_prefix_for(input_file=input_file, input_root=input_path, output=output)
         volume = read_input_or_dummy(input_file, input_shape)
-        prediction = predict_volume(volume, model_3d, device)
+        prediction = predict_volume(volume, model_3d, device, normalize_input=normalize_input)
         write_mask_ome_tiff(prediction, output_prefix)
+        if postprocess_instances:
+            instances = extract_nuclei_instances(
+                prediction=prediction,
+                nuclei_label=nuclei_label,
+                radius=neighbor_radius,
+            )
+            write_instances_tsv(instances=instances, output_prefix=output_prefix)
 
 
 @click.group(invoke_without_command=True)
@@ -204,6 +293,10 @@ def main(ctx: click.Context) -> None:
             dropout_rate=0.25,
             seed=42,
             cuda=False,
+            normalize_input=True,
+            postprocess_instances=False,
+            nuclei_label=1,
+            neighbor_radius=2.0,
         )
 
 
@@ -224,6 +317,32 @@ def main(ctx: click.Context) -> None:
 @click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
 @click.option("--seed", default=42, show_default=True, type=int, help="Random seed for dummy input generation and model init.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
+@click.option(
+    "--normalize-input/--no-normalize-input",
+    default=True,
+    show_default=True,
+    help="Enable/disable skimage.exposure.rescale_intensity normalization before model inference.",
+)
+@click.option(
+    "--postprocess-instances/--no-postprocess-instances",
+    default=False,
+    show_default=True,
+    help="Run KDTree+NetworkX graph clustering (strongly connected components) and export nuclei TSV.",
+)
+@click.option(
+    "--nuclei-label",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Class label in the predicted mask interpreted as nuclei for instance extraction.",
+)
+@click.option(
+    "--neighbor-radius",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Radius used to create dense voxel neighborhoods with KDTree for graph clustering.",
+)
 def predict(
     input_path: str | None,
     model_path: str | None,
@@ -235,6 +354,10 @@ def predict(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    normalize_input: bool,
+    postprocess_instances: bool,
+    nuclei_label: int,
+    neighbor_radius: float,
 ) -> None:
     """Run inference from provided input volumes or generated random input."""
     run_inference(
@@ -248,6 +371,10 @@ def predict(
         dropout_rate=dropout_rate,
         seed=seed,
         cuda=cuda,
+        normalize_input=normalize_input,
+        postprocess_instances=postprocess_instances,
+        nuclei_label=nuclei_label,
+        neighbor_radius=neighbor_radius,
     )
 
 
@@ -260,6 +387,12 @@ def predict(
 @click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
 @click.option("--seed", default=42, show_default=True, type=int, help="Seed for random input/model initialization.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
+@click.option(
+    "--normalize-input/--no-normalize-input",
+    default=True,
+    show_default=True,
+    help="Enable/disable skimage.exposure.rescale_intensity normalization before model inference.",
+)
 def smoke_test(
     output: str,
     input_shape: str,
@@ -269,6 +402,7 @@ def smoke_test(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    normalize_input: bool,
 ) -> None:
     """Generate random 3D input, run untrained model, and write OME-TIFF mask."""
     run_inference(
@@ -282,6 +416,10 @@ def smoke_test(
         dropout_rate=dropout_rate,
         seed=seed,
         cuda=cuda,
+        postprocess_instances=False,
+        nuclei_label=1,
+        neighbor_radius=2.0,
+        normalize_input=normalize_input,
     )
 
 

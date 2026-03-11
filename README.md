@@ -1,5 +1,10 @@
 # nuxnet-inference
 
+`nuxnet-inference` is a CLI-focused 3D nuclei localization and segmentation inference tool built around a 3D U-Net.
+It is designed for volumetric microscopy-style data where nuclei are segmented as foreground instances, and it includes an optional nuclei-localization post-processing stage that outputs per-nucleus centroids and sizes.
+
+The model and workflow are aligned with the NuMorph context (Kolesová et al., 2021), i.e., whole-brain nuclei analysis using 3D U-Net-based segmentation on the same dataset setting used by the original NuMorph 3D U-Net work.
+
 A lightweight PyTorch-only package for 3D segmentation inference.
 
 This repository ships:
@@ -33,6 +38,18 @@ Run with a custom OME-TIFF 3D input volume (with `ZYX` axes):
 nuxnet-pred predict --arch unet3d --input ./input_volume.ome.tiff --output ./predictions/demo
 ```
 
+Run inference and extract nuclei instances table (TSV):
+
+```console
+nuxnet-pred predict --arch unet3d --input ./input_volume.ome.tiff --output ./predictions/demo --postprocess-instances --nuclei-label 1 --neighbor-radius 2.0
+```
+
+Disable normalization if needed:
+
+```console
+nuxnet-pred predict --arch unet3d --input ./input_volume.ome.tiff --output ./predictions/demo --no-normalize-input
+```
+
 Run with a checkpoint:
 
 ```console
@@ -46,7 +63,35 @@ The `nuxnet-pred` CLI now exposes two explicit subcommands:
 - `predict`: run inference from one OME-TIFF volume or from all TIFF/OME-TIFF files in a folder.
 - `smoke-test`: generate a random 3D volume, initialize an untrained model, run a forward pass, and write the predicted mask.
 
-Both commands save masks as OME-TIFF files (`.ome.tiff`) with `ZYX` axes metadata.
+Both commands save masks as OME-TIFF files (`.ome.tiff`) with `ZYX` axes metadata. When `--postprocess-instances` is enabled in `predict`, a nuclei table is also written as `<output>.nuclei.tsv`. The post-processing uses Scikit-Image for mask handling, a SciPy KDTree (radius-based neighbors), and a NetworkX directed voxel graph with strongly connected components for clustering.
+
+## Post-processing for nuclei localization (TSV export)
+
+To execute post-processing, run `predict` with `--postprocess-instances`:
+
+```console
+nuxnet-pred predict --arch unet3d --input ./input_volume.ome.tiff --output ./predictions/demo --postprocess-instances --nuclei-label 1 --neighbor-radius 2.0
+```
+
+This writes:
+
+- segmentation mask: `./predictions/demo.ome.tiff`
+- nuclei table: `./predictions/demo.nuclei.tsv`
+
+Algorithm summary (current implementation):
+
+1. Build nuclei mask from predicted class label (`--nuclei-label`).
+2. Extract nuclei voxel coordinates from the binary mask.
+3. Build a SciPy KDTree and run radius range queries (`scipy.spatial.KDTree`, `query_ball_point`) to find nearby nuclei voxels.
+4. Build a voxel topology graph in NetworkX (`networkx.DiGraph`) from neighbor relations.
+5. Extract clusters using strongly connected components (`networkx.strongly_connected_components`).
+6. Compute centroid `(z, y, x)` and `size_voxels` per component and export TSV.
+
+Python libraries/functions used:
+
+- Scikit-Image: `skimage.exposure.rescale_intensity` (optional input normalization), `skimage.measure.label` (mask labeling helper).
+- SciPy: `scipy.spatial.KDTree`, `KDTree.query_ball_point`.
+- NetworkX: `networkx.DiGraph`, `networkx.strongly_connected_components`.
 
 ## CLI parameters
 
@@ -58,6 +103,7 @@ Shared model/runtime parameters (available in both commands):
 - `--dropout-rate FLOAT`: dropout used in UNet3D blocks.
 - `--seed INTEGER`: seed used for reproducibility.
 - `--cuda/--no-cuda`: enable CUDA when available.
+- `--normalize-input/--no-normalize-input`: enable/disable input intensity normalization with `skimage.exposure.rescale_intensity` using image min/max.
 
 `predict` parameters:
 
@@ -65,6 +111,9 @@ Shared model/runtime parameters (available in both commands):
 - `--model TEXT`: optional model checkpoint (plain `state_dict` or dict containing `state_dict`).
 - `--output TEXT`: output prefix (single input) or output directory (input folder).
 - `--input-shape TEXT`: shape `D,H,W` used only when `--input` is omitted.
+- `--postprocess-instances/--no-postprocess-instances`: enable/disable nuclei instance extraction and TSV export.
+- `--nuclei-label INTEGER`: class label interpreted as nuclei in the predicted mask (default `1`).
+- `--neighbor-radius FLOAT`: radius used by KDTree to create a dense voxel-neighborhood graph (default `2.0`).
 
 `smoke-test` parameters:
 
