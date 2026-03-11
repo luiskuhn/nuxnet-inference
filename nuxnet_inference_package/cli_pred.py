@@ -7,6 +7,7 @@ import click
 import numpy as np
 import torch
 from rich import print, traceback
+from tifffile import imwrite
 from torch import nn
 
 from nuxnet_inference_package.models.unet3d import UNet3D
@@ -32,7 +33,7 @@ class DummyNuxNet3D(nn.Module):
 def parse_shape(shape: str) -> tuple[int, int, int]:
     dims = tuple(int(v.strip()) for v in shape.split(","))
     if len(dims) != 3:
-        raise click.ClickException("--shape must be D,H,W")
+        raise click.ClickException("Shape must be formatted as D,H,W")
     return dims
 
 
@@ -68,7 +69,7 @@ def initialize_model(
 def read_input_or_dummy(file_path: Path | None, shape: str) -> np.ndarray:
     if file_path is None:
         volume = np.random.rand(*parse_shape(shape)).astype(np.float32)
-        print(f"[bold yellow]No input file provided; generated dummy 3D input with shape {volume.shape}.")
+        print(f"[bold yellow]Generated random 3D input with shape {volume.shape}.")
     else:
         print(f"[bold yellow]Input: {file_path}")
         volume = np.load(file_path).astype(np.float32)
@@ -110,28 +111,20 @@ def output_prefix_for(input_file: Path | None, input_root: str | None, output: s
     return output_path
 
 
-def write_results(prediction: np.ndarray, output_prefix: Path) -> None:
-    output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    np.save(output_prefix, prediction)
-    print(f"[bold green]Output: {output_prefix}.npy")
+def write_mask_ome_tiff(prediction: np.ndarray, output_prefix: Path) -> Path:
+    """Write segmentation mask as OME-TIFF with ZYX axis metadata."""
+    output_path = output_prefix.with_suffix(".ome.tiff")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imwrite(output_path, prediction, ome=True, metadata={"axes": "ZYX"})
+    print(f"[bold green]Output: {output_path}")
+    return output_path
 
 
-@click.command()
-@click.option("-i", "--input", required=False, type=str, help="Path to a .npy file or directory of .npy files.")
-@click.option("-m", "--model", required=False, type=str, help="Optional path to a .pt checkpoint (state_dict).")
-@click.option("-o", "--output", default="predictions", required=True, type=str, help="Output path prefix or folder.")
-@click.option("--shape", default="16,64,64", show_default=True, type=str, help="Dummy input shape as D,H,W when --input is omitted.")
-@click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Inference model architecture.")
-@click.option("--classes", default=3, show_default=True, type=int, help="Number of output classes.")
-@click.option("--in-channels", default=1, show_default=True, type=int, help="Number of input channels expected by model.")
-@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout used by UNet3D blocks.")
-@click.option("--seed", default=42, show_default=True, type=int, help="RNG seed for dummy input and model init.")
-@click.option("-c/-nc", "--cuda/--no-cuda", type=bool, default=False, help="Run on CUDA if available.")
-def main(
-    input: str | None,
-    model: str | None,
+def run_inference(
+    input_path: str | None,
+    model_path: str | None,
     output: str,
-    shape: str,
+    input_shape: str,
     arch: str,
     classes: int,
     in_channels: int,
@@ -139,15 +132,13 @@ def main(
     seed: int,
     cuda: bool,
 ) -> None:
-    """Run 3D segmentation inference (nuxnet-pred)."""
     print("[bold blue]nuxnet-pred")
-
     np.random.seed(seed)
     torch.manual_seed(seed)
     device = torch.device("cuda" if cuda and torch.cuda.is_available() else "cpu")
 
     model_3d = initialize_model(
-        model_path=model,
+        model_path=model_path,
         arch=arch,
         in_channels=in_channels,
         classes=classes,
@@ -155,11 +146,104 @@ def main(
         device=device,
     )
 
-    for input_file in iter_inputs(input):
-        output_prefix = output_prefix_for(input_file=input_file, input_root=input, output=output)
-        volume = read_input_or_dummy(input_file, shape)
+    for input_file in iter_inputs(input_path):
+        output_prefix = output_prefix_for(input_file=input_file, input_root=input_path, output=output)
+        volume = read_input_or_dummy(input_file, input_shape)
         prediction = predict_volume(volume, model_3d, device)
-        write_results(prediction, output_prefix)
+        write_mask_ome_tiff(prediction, output_prefix)
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+def main(ctx: click.Context) -> None:
+    """nuxnet-pred CLI for 3D segmentation inference and smoke testing."""
+    if ctx.invoked_subcommand is None:
+        # Backward-compatible default behavior.
+        ctx.invoke(
+            predict,
+            input_path=None,
+            model_path=None,
+            output="predictions",
+            input_shape="16,64,64",
+            arch="unet3d",
+            classes=3,
+            in_channels=1,
+            dropout_rate=0.25,
+            seed=42,
+            cuda=False,
+        )
+
+
+@main.command("predict")
+@click.option("--input", "input_path", required=False, type=str, help="Path to a .npy volume or a folder containing .npy volumes.")
+@click.option("--model", "model_path", required=False, type=str, help="Optional .pt checkpoint to load. If omitted, model is randomly initialized.")
+@click.option("--output", default="predictions", show_default=True, required=True, type=str, help="Output prefix or output folder for .ome.tiff mask files.")
+@click.option("--input-shape", default="16,64,64", show_default=True, type=str, help="Shape D,H,W used only when --input is omitted.")
+@click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Network architecture used for inference.")
+@click.option("--classes", default=3, show_default=True, type=int, help="Number of output segmentation classes.")
+@click.option("--in-channels", default=1, show_default=True, type=int, help="Number of input channels expected by the model.")
+@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
+@click.option("--seed", default=42, show_default=True, type=int, help="Random seed for dummy input generation and model init.")
+@click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
+def predict(
+    input_path: str | None,
+    model_path: str | None,
+    output: str,
+    input_shape: str,
+    arch: str,
+    classes: int,
+    in_channels: int,
+    dropout_rate: float,
+    seed: int,
+    cuda: bool,
+) -> None:
+    """Run inference from provided input volumes or generated random input."""
+    run_inference(
+        input_path=input_path,
+        model_path=model_path,
+        output=output,
+        input_shape=input_shape,
+        arch=arch,
+        classes=classes,
+        in_channels=in_channels,
+        dropout_rate=dropout_rate,
+        seed=seed,
+        cuda=cuda,
+    )
+
+
+@main.command("smoke-test")
+@click.option("--output", default="smoke_test_mask", show_default=True, type=str, help="Output prefix for generated .ome.tiff mask.")
+@click.option("--input-shape", default="16,64,64", show_default=True, type=str, help="Random 3D input shape formatted as D,H,W.")
+@click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Architecture used for the untrained forward pass.")
+@click.option("--classes", default=3, show_default=True, type=int, help="Number of output classes.")
+@click.option("--in-channels", default=1, show_default=True, type=int, help="Number of model input channels.")
+@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
+@click.option("--seed", default=42, show_default=True, type=int, help="Seed for random input/model initialization.")
+@click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
+def smoke_test(
+    output: str,
+    input_shape: str,
+    arch: str,
+    classes: int,
+    in_channels: int,
+    dropout_rate: float,
+    seed: int,
+    cuda: bool,
+) -> None:
+    """Generate random 3D input, run untrained model, and write OME-TIFF mask."""
+    run_inference(
+        input_path=None,
+        model_path=None,
+        output=output,
+        input_shape=input_shape,
+        arch=arch,
+        classes=classes,
+        in_channels=in_channels,
+        dropout_rate=dropout_rate,
+        seed=seed,
+        cuda=cuda,
+    )
 
 
 if __name__ == "__main__":
