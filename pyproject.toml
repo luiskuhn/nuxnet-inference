@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nuxnet-inference"
+version = "2.1.0"
+description = "Minimal 3D nuclei segmentation inference CLI."
+readme = "README.rst"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "NuxNet contributors", email = "noreply@example.org" }
+]
+keywords = ["nuclei", "segmentation", "inference", "3d", "unet"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "click>=8.1,<9.0",
+  "numpy>=1.24,<3.0",
+  "torch>=2.1,<3.0",
+  "rich>=13.0,<14.0",
+]
+
+[project.scripts]
+nuxnet-pred = "nuxnet_inference_package.cli_pred:main"
+
+[project.urls]
+Homepage = "https://github.com/nuxnet/nuxnet-inference"
+Repository = "https://github.com/nuxnet/nuxnet-inference"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["nuxnet_inference_package*"]
