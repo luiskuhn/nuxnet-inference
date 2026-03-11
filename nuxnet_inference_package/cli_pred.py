@@ -7,7 +7,7 @@ import click
 import numpy as np
 import torch
 from rich import print, traceback
-from tifffile import imwrite
+from tifffile import TiffFile, imwrite
 from torch import nn
 
 from nuxnet_inference_package.models.unet3d import UNet3D
@@ -66,13 +66,42 @@ def initialize_model(
     return model
 
 
+def _volume_from_ome_tiff(file_path: Path) -> np.ndarray:
+    with TiffFile(file_path) as tif:
+        series = tif.series[0]
+        volume = series.asarray()
+        axes = series.axes
+
+    if not set("ZYX").issubset(set(axes)):
+        raise click.ClickException(
+            f"Expected OME-TIFF axes to include ZYX, got axes '{axes}' for shape {volume.shape}."
+        )
+
+    axis_index = {axis: idx for idx, axis in enumerate(axes)}
+    order = [axis_index["Z"], axis_index["Y"], axis_index["X"]] + [
+        idx for idx, axis in enumerate(axes) if axis not in {"Z", "Y", "X"}
+    ]
+    volume = np.transpose(volume, order)
+
+    if volume.ndim > 3:
+        extra_shape = volume.shape[3:]
+        if any(size != 1 for size in extra_shape):
+            raise click.ClickException(
+                "Expected singleton dimensions for non-ZYX axes in OME-TIFF input, "
+                f"got shape {volume.shape} after reordering axes from '{axes}'."
+            )
+        volume = np.squeeze(volume, axis=tuple(range(3, volume.ndim)))
+
+    return volume.astype(np.float32)
+
+
 def read_input_or_dummy(file_path: Path | None, shape: str) -> np.ndarray:
     if file_path is None:
         volume = np.random.rand(*parse_shape(shape)).astype(np.float32)
         print(f"[bold yellow]Generated random 3D input with shape {volume.shape}.")
     else:
         print(f"[bold yellow]Input: {file_path}")
-        volume = np.load(file_path).astype(np.float32)
+        volume = _volume_from_ome_tiff(file_path)
 
     if volume.ndim != 3:
         raise click.ClickException(f"Expected 3D volume with shape (D,H,W), got shape {volume.shape}")
@@ -93,7 +122,11 @@ def iter_inputs(input_path: str | None) -> Iterable[Path | None]:
 
     path = Path(input_path)
     if path.is_dir():
-        yield from sorted(path.glob("*.npy"))
+        patterns = ("*.ome.tiff", "*.ome.tif", "*.tiff", "*.tif")
+        files = []
+        for pattern in patterns:
+            files.extend(path.glob(pattern))
+        yield from sorted(set(files))
     else:
         yield path
 
@@ -175,7 +208,13 @@ def main(ctx: click.Context) -> None:
 
 
 @main.command("predict")
-@click.option("--input", "input_path", required=False, type=str, help="Path to a .npy volume or a folder containing .npy volumes.")
+@click.option(
+    "--input",
+    "input_path",
+    required=False,
+    type=str,
+    help="Path to an OME-TIFF volume (.ome.tiff/.ome.tif) or a folder containing OME-TIFF files.",
+)
 @click.option("--model", "model_path", required=False, type=str, help="Optional .pt checkpoint to load. If omitted, model is randomly initialized.")
 @click.option("--output", default="predictions", show_default=True, required=True, type=str, help="Output prefix or output folder for .ome.tiff mask files.")
 @click.option("--input-shape", default="16,64,64", show_default=True, type=str, help="Shape D,H,W used only when --input is omitted.")
