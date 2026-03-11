@@ -8,8 +8,8 @@ __all__ = ['UNET', 'NESTEDUNET', 'U2NET']
 # Originally contained own implementation of was changed because of weight init
 # and adopted from https://github.com/ShawnBIT/UNet-family/blob/master/networks/UNet.py
 
-from rts_package.models.unet_super import UNetsuper
-from rts_package.models.unet_utils import init_weights, unetConv2, unetUp, _size_map, _upsample_like, RSU
+from nuxnet_package.models.unet_super import UNetsuper
+from nuxnet_package.models.unet_utils import init_weights, unetConv2, unetUp, _size_map, _upsample_like, RSU
 
 
 class UNET(UNetsuper):
