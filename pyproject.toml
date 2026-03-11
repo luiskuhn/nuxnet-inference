@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nuxnet-inference"
 version = "2.1.0"
-description = "Minimal 3D nuclei segmentation inference CLI."
+description = "PyTorch-only 3D U-Net inference package for volumetric segmentation."
 readme = "README.rst"
 requires-python = ">=3.9"
 license = "MIT"
