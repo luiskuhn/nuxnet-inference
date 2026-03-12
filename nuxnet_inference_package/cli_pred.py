@@ -13,6 +13,7 @@ from skimage import exposure, measure
 from tifffile import TiffFile, imwrite
 from torch import nn
 
+from nuxnet_inference_package.mlf_core import configure_reproducibility
 from nuxnet_inference_package.models.unet3d import UNet3D
 
 
@@ -242,15 +243,17 @@ def run_inference(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    deterministic: bool,
     normalize_input: bool,
     postprocess_instances: bool,
     nuclei_label: int,
     neighbor_radius: float,
 ) -> None:
     print("[bold blue]nuxnet-pred")
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    configure_reproducibility(seed=seed, deterministic=deterministic)
     device = torch.device("cuda" if cuda and torch.cuda.is_available() else "cpu")
+    print(f"[bold cyan]Deterministic mode:[/bold cyan] {'ON' if deterministic else 'OFF'}")
+    print(f"[bold cyan]Device:[/bold cyan] {device}")
 
     model_3d = initialize_model(
         model_path=model_path,
@@ -297,6 +300,7 @@ def main(ctx: click.Context) -> None:
             postprocess_instances=False,
             nuclei_label=1,
             neighbor_radius=2.0,
+            deterministic=False,
         )
 
 
@@ -317,6 +321,12 @@ def main(ctx: click.Context) -> None:
 @click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
 @click.option("--seed", default=42, show_default=True, type=int, help="Random seed for dummy input generation and model init.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
+@click.option(
+    "--deterministic/--no-deterministic",
+    default=False,
+    show_default=True,
+    help="Enable mlf-core-style deterministic execution settings (may reduce performance).",
+)
 @click.option(
     "--normalize-input/--no-normalize-input",
     default=True,
@@ -354,6 +364,7 @@ def predict(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    deterministic: bool,
     normalize_input: bool,
     postprocess_instances: bool,
     nuclei_label: int,
@@ -371,6 +382,7 @@ def predict(
         dropout_rate=dropout_rate,
         seed=seed,
         cuda=cuda,
+        deterministic=deterministic,
         normalize_input=normalize_input,
         postprocess_instances=postprocess_instances,
         nuclei_label=nuclei_label,
@@ -388,6 +400,12 @@ def predict(
 @click.option("--seed", default=42, show_default=True, type=int, help="Seed for random input/model initialization.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
 @click.option(
+    "--deterministic/--no-deterministic",
+    default=False,
+    show_default=True,
+    help="Enable mlf-core-style deterministic execution settings (may reduce performance).",
+)
+@click.option(
     "--normalize-input/--no-normalize-input",
     default=True,
     show_default=True,
@@ -402,6 +420,7 @@ def smoke_test(
     dropout_rate: float,
     seed: int,
     cuda: bool,
+    deterministic: bool,
     normalize_input: bool,
 ) -> None:
     """Generate random 3D input, run untrained model, and write OME-TIFF mask."""
@@ -416,6 +435,7 @@ def smoke_test(
         dropout_rate=dropout_rate,
         seed=seed,
         cuda=cuda,
+        deterministic=deterministic,
         postprocess_instances=False,
         nuclei_label=1,
         neighbor_radius=2.0,
