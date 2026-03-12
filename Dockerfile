@@ -1,11 +1,11 @@
-FROM python:3.8.12-slim-bullseye
+FROM python:3.12-slim-bookworm
 
-# A few Utilities to able to install C based libraries such as numpy
-RUN apt update
-RUN apt-get install -y procps wget
-RUN pip install --upgrade pip setuptools wheel
-# RUN pip install root-tissue-seg-package=1.0.7
+RUN apt update && apt-get install -y procps wget && rm -rf /var/lib/apt/lists/*
 
-CMD rts-pred
-CMD rts-pred-uncert
-CMD rts-feat-imp
+WORKDIR /app
+COPY . /app
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && pip install .
+
+CMD ["nuxnet-pred"]

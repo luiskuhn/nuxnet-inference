@@ -9,7 +9,7 @@ if "%SPHINXBUILD%" == "" (
 )
 set SOURCEDIR=.
 set BUILDDIR=_build
-set SPHINXPROJ=rts_package
+set SPHINXPROJ=nuxnet_inference
 
 if "%1" == "" goto help
 

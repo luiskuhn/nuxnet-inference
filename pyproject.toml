@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nuxnet-inference"
+version = "2.1.0"
+description = "PyTorch-only 3D U-Net inference package for volumetric segmentation."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "NuxNet contributors", email = "noreply@example.org" }
+]
+keywords = ["nuclei", "segmentation", "inference", "3d", "unet"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "click==8.1.8",
+  "numpy==1.26.4",
+  "torch==2.5.1",
+  "rich==13.9.4",
+  "tifffile==2024.8.30",
+  "scipy==1.13.1",
+  "scikit-image==0.24.0",
+  "networkx==3.2.1",
+]
+
+[project.scripts]
+nuxnet-pred = "nuxnet_inference_package.cli_pred:main"
+
+[project.urls]
+Homepage = "https://github.com/nuxnet/nuxnet-inference"
+Repository = "https://github.com/nuxnet/nuxnet-inference"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["nuxnet_inference_package*"]

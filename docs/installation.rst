@@ -4,48 +4,20 @@
 Installation
 ============
 
-
-Stable release
---------------
-
-To install rts_package, run this command in your terminal:
+Use Python 3.12 (recommended)
+-----------------------------
 
 .. code-block:: console
 
-    $ pip install rts_package
+    python3.12 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install --upgrade pip
 
-This is the preferred method to install rts_package, as it will always install the most recent stable release.
-
-If you don't have `pip`_ installed, this `Python installation guide`_ can guide
-you through the process.
-
-.. _pip: https://pip.pypa.io
-.. _Python installation guide: http://docs.python-guide.org/en/latest/starting/installation/
-
-
-From sources
-------------
-
-The sources for rts_package can be downloaded from the `Github repo`_.
-
-You can either clone the public repository:
+Install from source
+-------------------
 
 .. code-block:: console
 
-    $ git clone git://github.com/waseju/rts_package
+    pip install -e .
 
-Or download the `tarball`_:
-
-.. code-block:: console
-
-    $ curl -OJL https://github.com/waseju/rts_package/tarball/master
-
-Once you have a copy of the source, you can install it with:
-
-.. code-block:: console
-
-    $ make install
-
-
-.. _Github repo: https://github.com/waseju/rts_package
-.. _tarball: https://github.com/waseju/rts_package/tarball/master
+This installs the ``nuxnet-pred`` command for the minimal NuxNet inference scaffold.
