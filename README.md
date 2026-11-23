@@ -74,6 +74,47 @@ Run with a checkpoint:
 nuxnet-pred predict --arch unet3d --classes 3 --in-channels 1 --model ./checkpoint.pt --input ./input_volume.ome.tiff --output ./predictions/demo
 ```
 
+## Run it on the bundled example, and score it
+
+`examples/numorph_c075_0007/` contains one real NuMorph image/ground-truth mask pair,
+so the tool can be tested and **scored** without downloading the training dataset. The
+volume is stored at 2.5 / 0.75 / 0.75 µm, deliberately not on the network's
+3.0 / 1.0 / 1.0 µm grid, so a run exercises resampling, tiling and projection back.
+
+```console
+nuxnet-pred predict \
+    --input  examples/numorph_c075_0007/c075_0007_Bottom3.image.ome.tif \
+    --model  /path/to/numorph_fold1_weights.pt \
+    --output runs/c075 \
+    --classes 2 --dropout-rate 0.1 \
+    --target-voxel-spacing 3.0,1.0,1.0 \
+    --patch-size 32,128,128 \
+    --threshold 0.8 \
+    --postprocess-instances
+
+python scripts/score_example.py \
+    --prediction runs/c075.ome.tiff \
+    --truth      examples/numorph_c075_0007/c075_0007_Bottom3.mask.ome.tif
+```
+
+Expected with `numorph_fold1_weights.pt`:
+
+```
+training-grid Dice  0.8601
+round-trip ceiling  0.7877   <- a PERFECT mask after the same round trip
+input-grid Dice     0.7390   <- what was written to disk
+fraction of ceiling 93.8%
+```
+
+The ceiling matters: 64 slices compress to 53 on the training grid and back, which
+alone caps a perfect mask at 0.788 on this volume. Reading 0.739 as "74% correct"
+understates it — it is 94% of what the round trip allows.
+
+Note what the mask is: NuMorph targets are **2D single-slice discs** marking each
+nucleus's middle Z, median 63 voxels, not one-voxel points and not nucleus bodies. See
+`examples/numorph_c075_0007/README.md` for the measurements and the dataset's pending
+licence status.
+
 ## CLI overview
 
 The `nuxnet-pred` CLI now exposes two explicit subcommands:

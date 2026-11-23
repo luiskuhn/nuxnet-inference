@@ -508,8 +508,8 @@ def page_volume(pdf: PdfPages, result: dict, artifacts: Path, page: int, total: 
     fig.text(0.055, 0.235, "Object size distribution", fontsize=9.6,
              fontweight="bold", color=INK)
     caption(fig, 0.055, 0.221,
-            "Connected components (26-connectivity). The target is a CENTRE MARKER, so "
-            "both distributions are small by construction.")
+            "Connected components (26-connectivity). The target is a 2D single-slice disc "
+            "per nucleus (median 63 voxels), so a component of 1-2 voxels means under-segmentation.")
 
     axis = fig.add_axes([0.095, 0.115, 0.38, 0.085])
     upper = max(pred_sizes.max() if pred_sizes.size else 1,
@@ -867,9 +867,10 @@ def page_packaging(pdf: PdfPages, page: int, total: int, package_dir: Path | Non
         OPEN   replace the citation placeholder. A package without a resolvable citation
                is not acceptable in the zoo.
 
-        And the target must be stated plainly: this is a CENTRE MARKER, not a nucleus
-        body. Users who treat the foreground as a segmentation of nucleus volume will be
-        wrong by an order of magnitude in object size.
+        And the target must be stated plainly: each mask entry is a 2D single-slice
+        DISC marking a nucleus's middle Z (median 63 voxels, one slice thick), not a
+        one-voxel point and not a nucleus body. Users who treat the foreground as a 3D
+        segmentation will be wrong about object size AND about object extent.
         """).replace("\n        ", "\n"),
         fontsize=8.2,
         color=INK,
