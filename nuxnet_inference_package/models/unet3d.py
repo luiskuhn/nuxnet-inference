@@ -1,26 +1,25 @@
-"""The 3D U-Net, re-exported from the vendored training copy.
+"""Compatibility re-export of the 3D U-Net.
 
-There is exactly **one** architecture definition in this package, and it lives at
-``nuxnet_inference_package/training_parity/unet_3d_models.py`` -- a verbatim copy
-of the trainer's:
+The canonical definition now lives at the path that mirrors ``nuxnet-training``:
 
-    luiskuhn/nuxnet-training @ f716565
-    numorph_nuclei_segmentation/model/unet_3d_models.py
+    nuxnet-training       numorph_nuclei_segmentation/model/unet_3d_models.py
+    nuxnet-inference      nuxnet_inference_package/model/unet_3d_models.py
 
-Previously this module held a hand-written lookalike that had silently diverged --
-no residual shortcuts, ``bias=True`` convolutions, different module names -- so no
-trained checkpoint could be loaded. Keeping a single definition removes the
-possibility of that happening again; ``tests/test_unet3d_parity.py`` pins the
-parameter names and shapes against a real checkpoint.
-
-Import from here as before:
+That file is a verbatim copy of the trainer's. This module exists only so existing
+imports keep working:
 
     from nuxnet_inference_package.models.unet3d import UNet3D
+
+New code should import from ``nuxnet_inference_package.model`` instead.
+
+Before this change the module held a hand-written lookalike that had silently
+diverged -- no residual shortcuts, ``bias=True`` convolutions, different module
+names -- so no trained checkpoint could be loaded.
 """
 
 from __future__ import annotations
 
-from nuxnet_inference_package.training_parity.unet_3d_models import (
+from nuxnet_inference_package.model.unet_3d_models import (
     ConvBlock,
     DownSamplingBlock,
     InputBlock,

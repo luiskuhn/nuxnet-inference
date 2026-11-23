@@ -1,39 +1,36 @@
-"""Keep the vendored training code identical to ``nuxnet-training``.
+"""Keep the mirrored model identical to ``nuxnet-training``.
 
-This package does not re-implement the trainer's model and data-loading helpers; it
-copies them, because a checkpoint only reproduces its training behaviour if both
-sides compute the same thing. These tests are what makes "copied" trustworthy:
+This package does not re-implement the trainer's model; it copies it, because a
+checkpoint reproduces its training behaviour only if both sides compute the same
+thing. These tests are what makes "copied" trustworthy.
 
-* **verbatim** -- when the training checkout is available on disk, the vendored
-  files must be byte-identical to it, modulo the renames noted in each file.
-* **checkpoint parity** -- the parameter names and shapes must match a real
-  checkpoint produced by the trainer. This is the check that would have caught the
-  original bug, and it needs no training checkout.
+Two kinds of check:
 
-Point ``NUXNET_TRAINING_DIR`` at a clone to enable the verbatim checks:
+* **verbatim** -- when a training checkout is available, the mirrored file must be
+  identical to it. Point ``NUXNET_TRAINING_DIR`` at a clone to enable it.
+* **checkpoint parity** -- parameter names, shapes and residual shortcuts must match
+  a real checkpoint produced by the trainer. This needs no training checkout, and it
+  is the check that would have caught the original bug.
 
     NUXNET_TRAINING_DIR=~/projects/nuxnet-training pytest tests/test_training_parity.py
 
-Without it, the verbatim tests skip and the checkpoint parity tests still run.
+Without ``NUXNET_TRAINING_DIR`` the verbatim check skips and the rest still runs.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 
 import pytest
 import torch
 
-from nuxnet_inference_package.training_parity.unet_3d_models import UNet3D
+from nuxnet_inference_package.model.unet_3d_models import UNet3D
 
 GOLDEN = Path(__file__).parent / "unet3d_keys.json"
+PACKAGE = Path(__file__).parent.parent / "nuxnet_inference_package"
 TRAINING_DIR = os.environ.get("NUXNET_TRAINING_DIR")
-
-#: Upstream commit the vendored files were taken from.
-UPSTREAM_COMMIT = "f716565"
 
 
 def _upstream(*parts: str) -> Path:
@@ -45,65 +42,22 @@ def _upstream(*parts: str) -> Path:
     return path
 
 
-def _normalized(lines: list[str]) -> list[str]:
-    """Drop blank lines and trailing whitespace so formatting does not matter."""
-    return [line.rstrip() for line in lines if line.strip()]
+def _normalized(text: str) -> list[str]:
+    """Drop blank lines and trailing whitespace so formatting cannot matter."""
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
 
 
 # ---------------------------------------------------------------------------
-# verbatim checks (need NUXNET_TRAINING_DIR)
+# verbatim check (needs NUXNET_TRAINING_DIR)
 # ---------------------------------------------------------------------------
-def test_unet3d_is_verbatim_copy_of_training() -> None:
+def test_model_is_verbatim_copy_of_trainer() -> None:
+    """The mirrored model must be identical to the trainer's file, byte for byte."""
     upstream = _upstream("numorph_nuclei_segmentation", "model", "unet_3d_models.py")
-    vendored = (
-        Path(__file__).parent.parent
-        / "nuxnet_inference_package"
-        / "training_parity"
-        / "unet_3d_models.py"
+    mirrored = PACKAGE / "model" / "unet_3d_models.py"
+    assert _normalized(mirrored.read_text()) == _normalized(upstream.read_text()), (
+        "the mirrored UNet3D has diverged from the trainer; re-copy the file rather "
+        "than editing either side"
     )
-    assert _normalized(vendored.read_text().splitlines()) == _normalized(
-        upstream.read_text().splitlines()
-    ), (
-        "the vendored UNet3D has diverged from the trainer; re-copy it rather than "
-        "editing either side"
-    )
-
-
-def test_resampling_is_verbatim_copy_of_training() -> None:
-    """The resampling helpers must match, ignoring the leading-underscore rename."""
-    upstream = _upstream(
-        "numorph_nuclei_segmentation", "data_loading", "data_loader.py"
-    )
-    vendored = (
-        Path(__file__).parent.parent
-        / "nuxnet_inference_package"
-        / "training_parity"
-        / "pipeline.py"
-    )
-    if not vendored.is_file():
-        pytest.skip("pipeline.py not present in this revision")
-
-    source = upstream.read_text()
-
-    def extract(text: str, name: str) -> list[str]:
-        lines = text.splitlines()
-        start = next(
-            (i for i, line in enumerate(lines) if line.startswith(f"def _{name}(") or line.startswith(f"def {name}(")),
-            None,
-        )
-        if start is None:
-            return []
-        end = start + 1
-        while end < len(lines) and (not lines[end] or lines[end].startswith(("def ", "class ")) is False):
-            end += 1
-        return _normalized(lines[start:end])
-
-    for name in ("gaussian_blur_for_downsampling", "resample_volume_pair"):
-        want = extract(source, name)
-        got = extract(vendored.read_text(), name)
-        assert want, f"could not locate {name} upstream"
-        assert got, f"could not locate {name} in the vendored copy"
-        assert want == got, f"vendored {name} diverged from the trainer"
 
 
 # ---------------------------------------------------------------------------
