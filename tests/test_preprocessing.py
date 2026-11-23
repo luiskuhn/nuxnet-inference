@@ -168,3 +168,56 @@ def test_sliding_window_rejects_bad_input() -> None:
         sliding_window_predict(
             model=model, volume=np.zeros((8, 8, 8), dtype=np.float32), overlap=1.0
         )
+
+
+# ---------------------------------------------------------------------------
+# mask output must keep physical calibration
+# ---------------------------------------------------------------------------
+def test_written_mask_preserves_voxel_size(tmp_path) -> None:
+    """A mask without PhysicalSize misaligns anything that works in microns.
+
+    The input OME-TIFF carries 2.5/0.75/0.75 um; the mask must carry the same, or a
+    tool reporting distances treats it as 1 um isotropic and is wrong by 3.5x in XY
+    and 5x in Z. This was a real defect: the mask was written with axes only.
+    """
+    import re
+
+    import tifffile
+
+    from nuxnet_inference_package.cli_pred import write_mask_ome_tiff
+
+    # (4, 8, 8) rather than something smaller: tifffile 2022.4.8 refuses to write
+    # very small OME cubes ("axes do not match stored shape"), which is a library
+    # quirk and unrelated to what is being tested.
+    prediction = np.zeros((4, 8, 8), dtype=np.uint8)
+    prediction[1, 2:5, 2:5] = 1
+    spacing = np.array([2.5, 0.75, 0.75])
+
+    path = write_mask_ome_tiff(
+        prediction, tmp_path / "mask", voxel_size_um=spacing
+    )
+
+    with tifffile.TiffFile(path) as tif:
+        ome = tif.ome_metadata or ""
+        written = np.squeeze(tif.series[0].asarray())
+    found = {
+        axis: float(re.search(rf'PhysicalSize{axis}="([^"]+)"', ome).group(1))
+        for axis in ("Z", "Y", "X")
+    }
+    assert found == pytest.approx({"Z": 2.5, "Y": 0.75, "X": 0.75})
+    assert np.array_equal(written, prediction)
+
+
+def test_written_mask_without_spacing_is_still_valid(tmp_path) -> None:
+    """A plain TIFF input has no calibration to carry; the mask must still be written."""
+    import tifffile
+
+    from nuxnet_inference_package.cli_pred import write_mask_ome_tiff
+
+    prediction = np.ones((4, 8, 8), dtype=np.uint8)
+    path = write_mask_ome_tiff(prediction, tmp_path / "mask", voxel_size_um=None)
+
+    with tifffile.TiffFile(path) as tif:
+        written = np.squeeze(tif.series[0].asarray())
+    assert written.shape == prediction.shape
+    assert np.array_equal(written, prediction)

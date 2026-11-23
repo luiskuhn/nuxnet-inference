@@ -324,11 +324,36 @@ def output_prefix_for(input_file: Path | None, input_root: str | None, output: s
     return output_path
 
 
-def write_mask_ome_tiff(prediction: np.ndarray, output_prefix: Path) -> Path:
-    """Write segmentation mask as OME-TIFF with ZYX axis metadata."""
+def write_mask_ome_tiff(
+    prediction: np.ndarray,
+    output_prefix: Path,
+    voxel_size_um: np.ndarray | None = None,
+) -> Path:
+    """Write segmentation mask as OME-TIFF with ZYX axis metadata.
+
+    Carries the input's physical voxel size through when it is known. Without it the
+    mask is a dimensionless array: tools that report distances or align volumes in
+    microns will treat it as 1 um isotropic, which is wrong by 3.5x in XY and 5x in Z
+    for typical light-sheet data. The calibration is the same on both grids because
+    resampling preserves the physical extent.
+    """
     output_path = output_prefix.with_suffix(".ome.tiff")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    imwrite(output_path, prediction, ome=True, metadata={"axes": "ZYX"})
+    metadata: dict[str, object] = {"axes": "ZYX"}
+    if voxel_size_um is not None:
+        spacing = np.asarray(voxel_size_um, dtype=np.float64).ravel()
+        if spacing.size == 3 and np.all(spacing > 0):
+            metadata.update(
+                {
+                    "PhysicalSizeZ": float(spacing[0]),
+                    "PhysicalSizeY": float(spacing[1]),
+                    "PhysicalSizeX": float(spacing[2]),
+                    "PhysicalSizeZUnit": "\u00b5m",
+                    "PhysicalSizeYUnit": "\u00b5m",
+                    "PhysicalSizeXUnit": "\u00b5m",
+                }
+            )
+    imwrite(output_path, prediction, ome=True, metadata=metadata)
     print(f"[bold green]Output: {output_path}")
     return output_path
 
@@ -429,8 +454,13 @@ def run_inference(
             )
         else:
             volume = read_input_or_dummy(input_file, input_shape)
+            voxel_size = None
+            if input_file is not None:
+                # The mask must carry the input's calibration, so read it even on the
+                # legacy path; a mask without physical size misaligns downstream work.
+                volume, voxel_size = _volume_and_metadata_from_ome_tiff(input_file)
             prediction = predict_volume(volume, model_3d, device, normalize_input=normalize_input)
-        write_mask_ome_tiff(prediction, output_prefix)
+        write_mask_ome_tiff(prediction, output_prefix, voxel_size_um=voxel_size)
         # Post-processing is unchanged: same function, same arguments, same output.
         if postprocess_instances:
             instances = extract_nuclei_instances(
