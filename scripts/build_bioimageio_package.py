@@ -117,11 +117,16 @@ tags:
 
 # NuMorph nucleus-marker U-Net (fold {fold})
 
-A 3D U-Net that finds nucleus centres in cleared mouse-brain light-sheet data. It was
-trained on the NuMorph semantic-segmentation dataset, where the mask marks one voxel
-per nucleus centre rather than a filled nucleus body. The model reproduces that target:
-its output is a **marker** channel, and nuclei are recovered by finding peaks and
-clustering instances afterwards.
+A 3D U-Net that detects nuclei in cleared mouse-brain light-sheet data. It was trained
+on the NuMorph semantic-segmentation dataset, where each mask entry is a **2D
+single-slice disc** marking the middle Z of one nucleus, stored in a 3D volume. The
+model reproduces that target: its output is a **marker** channel, and instances are
+recovered by grouping the marker voxels afterwards.
+
+The target is neither a nucleus body nor a one-voxel point. Measured on the bundled
+example pair: 684 discs, median 63 voxels each, one slice thick, roughly 14 px across
+in XY at 2.5/0.75/0.75 um sampling. A prediction whose components are one or two
+voxels is badly under-segmenting, not merely "sparse".
 
 ## Read this before using the weights
 
@@ -150,10 +155,17 @@ Step 1 is not optional and is not something the state dict can enforce for you.
 
 ## What this model is not
 
-The target is a centre marker, not a nucleus body. If you need filled nuclei, this
-model gives you the detections to seed a watershed; do not treat its foreground as a
-segmentation of nucleus volume. Measured instance sizes are ~2 voxels in the marker
-channel by construction.
+The target is a flat 2D disc marking a nucleus's middle slice, not a filled 3D nucleus.
+If you need nucleus volumes, this model gives you detections to seed a watershed; do
+not treat its foreground as a segmentation of nucleus volume. A predicted component
+occupies one slice, so its voxel count measures the disc, not the nucleus.
+
+Two consequences worth stating plainly:
+
+* **It is a detection target, not a 3D segmentation target.** Expect one slice per
+  object even when the nucleus spans several.
+* **The mask is stored in 3D but curated in 2D.** Slices between markers carry no
+  information, which is why per-slice metrics on this dataset are naturally bimodal.
 
 ## Validation
 
@@ -189,7 +201,7 @@ type: model
 name: NuMorph nucleus-marker U-Net (fold {fold})
 version: 1.0.0
 description: >-
-  3D U-Net for nucleus-centre detection in cleared mouse-brain light-sheet microscopy.
+  3D U-Net detecting nucleus middle-slice markers in cleared mouse-brain light-sheet microscopy.
 authors:
   - name: Luis Kuhn
     github_user: luiskuhn
@@ -249,7 +261,7 @@ inputs:
 outputs:
   - id: logits
     description: >-
-      Raw background and marker logits; apply softmax(dim=1). Marker is a centre target.
+      Raw background and marker logits; apply softmax(dim=1). Marker is a 2D disc target.
     axes:
       - type: batch
       - type: channel
@@ -304,7 +316,7 @@ config:
     patch_size_zyx: {json.dumps(list(PATCH))}
     normalization: per-volume min-max after resampling
     output: logits, softmax required
-    nuclei_target: centre marker, not filled body
+    nuclei_target: 2D single-slice disc per nucleus, median 63 voxels, not a filled body
 """
     )
 
