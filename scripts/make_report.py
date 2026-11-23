@@ -499,17 +499,21 @@ def page_packaging(pdf: PdfPages, page: int, total: int, package_dir: Path | Non
         fig.text(0.10, 0.250, f"verified package: {package_dir.name}  ({total_kib:.0f} KiB)",
                  fontsize=8.6, color=GREEN, family="monospace")
 
-    fig.text(0.08, 0.190, "Before publishing", fontsize=11, fontweight="bold", color=AMBER)
+    fig.text(0.08, 0.190, "Status", fontsize=11, fontweight="bold", color=AMBER)
     fig.text(
         0.10,
         0.160,
         dedent("""
-        - replace the citation placeholder; a package without a resolvable citation
-          is not acceptable in the zoo;
-        - run `bioimageio test <package.zip>` and attach the output;
-        - decide whether to ship one fold or an ensemble, and say which in the card;
-        - the target is a CENTRE MARKER, not a nucleus body. State it plainly, or
-          users will treat the foreground as a segmentation of nucleus volume.
+        DONE   bioimageio test on the shipped zip: OVERALL passed, for all
+               format, reload and output-reproduction checks;
+        DONE   shipping one model (fold 1); the other four folds are
+               cross-validation replicates and stay reproducible upstream;
+        OPEN   replace the citation placeholder. A package without a
+               resolvable citation is not acceptable in the zoo.
+
+        And state plainly that the target is a CENTRE MARKER, not a nucleus
+        body, or users will treat the foreground as a segmentation of
+        nucleus volume.
         """),
         fontsize=9.2,
         color=INK,
