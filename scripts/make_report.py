@@ -447,11 +447,15 @@ def page_packaging(pdf: PdfPages, page: int, total: int, package_dir: Path | Non
         3. that every spatial axis must be a multiple of 4 -- the decoder upsamples
            twice, so anything else raises a tensor-size mismatch rather than
            degrading gracefully.
+
+        The same blind spot bit the CLI's own output: masks were written without
+        PhysicalSize, so they aligned with the input array but not with the specimen.
+        Carrying the calibration through was a separate fix.
         """),
-        fontsize=9.8,
+        fontsize=9.6,
         color=INK,
         va="top",
-        linespacing=1.62,
+        linespacing=1.6,
     )
 
     fig.text(0.08, 0.640, "Package contents", fontsize=11, fontweight="bold", color=BLUE)
