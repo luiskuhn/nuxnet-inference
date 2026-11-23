@@ -28,6 +28,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import tifffile
 import torch
 
 from nuxnet_inference_package.model.unet_3d_models import UNet3D
@@ -65,6 +66,14 @@ def write_tensor_files(out: Path, model: UNet3D) -> dict[str, str]:
     np.save(out / "test-input.npy", volume.numpy())  # (1, 1, z, y, x) to match declared axes
     np.save(out / "test-output.npy", logits.numpy())  # (1, 2, z, y, x)
 
+    # sample_tensor must be a real image format, not .npy: bioimageio validates it with
+    # imageio, which has no .npy backend and fails the whole description with
+    # "Could not find a backend to open <bytes>". test_tensor is read by bioimageio.core
+    # and may be .npy. The trainer's exports make the same split (sample-*.tif +
+    # test-*.npy), so match it.
+    tifffile.imwrite(out / "sample-input.tif", volume.numpy()[0, 0])
+    tifffile.imwrite(out / "sample-output.tif", logits.numpy()[0])
+
     # Softmax'd marker probability, which is what a reader of the model card cares about.
     probability = torch.softmax(logits, dim=1)[0, 1].numpy()
     print(
@@ -75,6 +84,8 @@ def write_tensor_files(out: Path, model: UNet3D) -> dict[str, str]:
     return {
         "test-input.npy": sha256(out / "test-input.npy"),
         "test-output.npy": sha256(out / "test-output.npy"),
+        "sample-input.tif": sha256(out / "sample-input.tif"),
+        "sample-output.tif": sha256(out / "sample-output.tif"),
     }
 
 
@@ -178,10 +189,7 @@ type: model
 name: NuMorph nucleus-marker U-Net (fold {fold})
 version: 1.0.0
 description: >-
-  3D U-Net detecting nucleus centres in cleared mouse-brain light-sheet microscopy.
-  Outputs background and marker logits at 2 classes. Requires input resampled to
-  {", ".join(f"{v:g}" for v in TARGET_VOXEL_SPACING)} um (Z,Y,X) and per-volume min-max
-  normalization; see the model card, the network cannot infer physical scale itself.
+  3D U-Net for nucleus-centre detection in cleared mouse-brain light-sheet microscopy.
 authors:
   - name: Luis Kuhn
     github_user: luiskuhn
@@ -205,8 +213,7 @@ cite:
 inputs:
   - id: input
     description: >-
-      Normalized volume already resampled to {", ".join(f"{v:g}" for v in TARGET_VOXEL_SPACING)} um per
-      voxel in Z, Y, X. Every spatial axis must be a multiple of 4.
+      Normalized volume resampled to {", ".join(f"{v:g}" for v in TARGET_VOXEL_SPACING)} um per voxel (Z,Y,X); axes must be multiples of 4.
     axes:
       - type: batch
         size: 1
@@ -234,16 +241,15 @@ inputs:
         - 0.0
         - 1.0
     sample_tensor:
-      source: test-input.npy
-      sha256: {hashes["test-input.npy"]}
+      source: sample-input.tif
+      sha256: {hashes["sample-input.tif"]}
     test_tensor:
       source: test-input.npy
       sha256: {hashes["test-input.npy"]}
 outputs:
   - id: logits
     description: >-
-      Unnormalized background and marker logits. Apply softmax(dim=1) to obtain
-      probabilities. The marker channel is a nucleus-centre target, not a filled body.
+      Raw background and marker logits; apply softmax(dim=1). Marker is a centre target.
     axes:
       - type: batch
       - type: channel
@@ -271,8 +277,8 @@ outputs:
         - null
         - null
     sample_tensor:
-      source: test-output.npy
-      sha256: {hashes["test-output.npy"]}
+      source: sample-output.tif
+      sha256: {hashes["sample-output.tif"]}
     test_tensor:
       source: test-output.npy
       sha256: {hashes["test-output.npy"]}
