@@ -111,16 +111,20 @@ def pyramid(volume: np.ndarray, levels: int, reducer: str) -> list[np.ndarray]:
     return out
 
 
-def write_group(root_path: Path, name: str, levels: list[np.ndarray],
-                scale, translation, region_start, source_scale,
-                colour: str, label: str, compressor) -> None:
-    import zarr
+def write_group(parent, name: str | None, levels: list[np.ndarray],
+                scale, translation, level_scales, colour: str, label: str,
+                compressor, ngff_type: str = "gaussian") -> None:
+    """Write one multiscale image into `parent`, optionally under a child group.
 
-    group = zarr.open_group(str(root_path), mode="a")
-    node = group.require_group(name)
+    `name=None` writes the arrays directly into `parent`, which is what an OME-NGFF
+    image at the root of a store requires: the root group itself must carry the
+    multiscales metadata and the numbered array levels. A root that instead holds
+    child groups with the arrays inside them is not an image to a reader, and
+    napari-ome-zarr returns zero layers for it.
+    """
+    node = parent if name is None else parent.require_group(name)
     node.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
 
-    level_scales = []
     for level, data in enumerate(levels):
         chunk = tuple(min(int(c), 64) for c in data.shape)
         array = node.create_dataset(
@@ -128,12 +132,12 @@ def write_group(root_path: Path, name: str, levels: list[np.ndarray],
             overwrite=True, fill_value=0,
         )
         array.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
-        level_scales.append([s * (2 ** level) for s in scale])
 
     # Build the entry as a plain dict first. Mutating a value already stored in
     # node.attrs does not persist, because zarr serialises on assignment: doing
     # node.attrs["multiscales"][0]["name"] = label silently loses the label.
-    entry = axis_metadata(scale, translation, region_start, level_scales, name=label)
+    entry = axis_metadata(scale, translation, (0, 0, 0), level_scales, name=label)
+    entry["type"] = ngff_type
     node.attrs["multiscales"] = [entry]
     node.attrs["omero"] = {
         "channels": [{"color": colour, "label": label,
@@ -184,15 +188,26 @@ def main() -> None:
         return [values[axes.index(a)] for a in ("z", "y", "x")]
 
     scale = pick(full_scale)
-    translation = pick(full_translation)
+    source_translation = pick(full_translation)
     print(f"source axes       {axes}")
     print(f"source scale      Z {scale[0]:.4f}  Y {scale[1]:.4f}  X {scale[2]:.4f} um")
-    print(f"source translation Z {translation[0]:.2f}  Y {translation[1]:.2f}  "
-          f"X {translation[2]:.2f} um")
+    print(f"source translation Z {source_translation[0]:.2f}  "
+          f"Y {source_translation[1]:.2f}  X {source_translation[2]:.2f} um")
 
     z_range, y_range, x_range = span(args.z_range), span(args.y_range), span(args.x_range)
     region = (z_range[0], y_range[0], x_range[0])
     shape = (z_range[1] - z_range[0], y_range[1] - y_range[0], x_range[1] - x_range[0])
+
+    # Absolute physical origin of voxel (0,0,0) of this crop. Computed once, here,
+    # because it is the transform BOTH layers must carry: if image and mask compute
+    # it independently and disagree by one axis, they overlay in the array but not in
+    # the specimen. axis_metadata then receives a zero region start and simply writes
+    # this value through.
+    translation = [
+        float(source_translation[i] + region[i] * scale[i]) for i in range(3)
+    ]
+    print(f"crop origin       Z {translation[0]:.2f}  Y {translation[1]:.2f}  "
+          f"X {translation[2]:.2f} um  (absolute)")
     print(f"region            Z {z_range[0]}:{z_range[1]}  Y {y_range[0]}:{y_range[1]}  "
           f"X {x_range[0]}:{x_range[1]}  = {shape}")
 
@@ -220,16 +235,30 @@ def main() -> None:
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
     image_compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
+    group = zarr.open_group(str(out), mode="a")
+
+    # ---- image at the ROOT ---------------------------------------------------
+    # OME-NGFF: the root group of an image store holds the multiscales metadata and
+    # the numbered array levels directly. Putting them in a child "image" group makes
+    # the store a plain container of groups, which napari-ome-zarr skips entirely.
     print("writing image levels...")
     image_levels = pyramid(image, args.levels, reducer="mean")
-    write_group(out, "image", image_levels, scale, translation, region, scale,
+    level_scales = [[s * (2 ** level) for s in scale]
+                    for level in range(len(image_levels))]
+    write_group(group, None, image_levels, scale, translation, level_scales,
                 "FFFFFF", "nuclei (SYTOX)", image_compressor)
 
+    # ---- mask as a label image ----------------------------------------------
+    # Nested under labels/, not beside the image. That is the OME-NGFF place for a
+    # segmentation of an image, and it is what tells a reader to overlay rather than
+    # open a second, unrelated image.
     if mask is not None:
         print("writing mask levels...")
+        labels = group.require_group("labels")
+        labels.attrs["labels"] = ["nuclei"]
         mask_levels = pyramid(mask.astype(np.uint8), args.levels, reducer="max")
-        write_group(out, "nuclei", mask_levels, scale, translation, region, scale,
-                    "FF00FF", "nuclei mask", compressor)
+        write_group(labels, "nuclei", mask_levels, scale, translation, level_scales,
+                    "FF00FF", "nuclei mask", compressor, ngff_type="label")
 
     # ---- optional spots ------------------------------------------------------
     if args.spots:
@@ -242,15 +271,16 @@ def main() -> None:
         keep = (
             (px[:, 0] >= z_range[0]) & (px[:, 0] < z_range[1])
             & (px[:, 1] >= y_range[0]) & (px[:, 1] < y_range[1])
-            & (px[:, 2] >= x_range[0]) & (px[:, 2] < x_range[2 - 1])
+            & (px[:, 2] >= x_range[0]) & (px[:, 2] < x_range[1])
         )
         local = px[keep] - np.array(region)
         # Absolute physical coordinates, so the points land in the same frame as
-        # the image rather than at the crop origin.
+        # the image. `translation` is already the absolute origin of the crop, so
+        # the region offset must NOT be added again here.
         physical = np.stack([
-            local[:, 0] * scale[0] + translation[0] + region[0] * scale[0],
-            local[:, 1] * scale[1] + translation[1] + region[1] * scale[1],
-            local[:, 2] * scale[2] + translation[2] + region[2] * scale[2],
+            local[:, 0] * scale[0] + translation[0],
+            local[:, 1] * scale[1] + translation[1],
+            local[:, 2] * scale[2] + translation[2],
         ], axis=1)
         group = zarr.open_group(str(out), mode="a")
         node = group.require_group("spots")
@@ -266,22 +296,17 @@ def main() -> None:
         }
         print(f"spots             {len(local):,} points written (absolute µm)")
 
-    out_attrs = {
-        "multiscales": [
-            {"name": "ear1_1-6m ROI", "version": "0.4",
-             "axes": [
-                 {"name": "z", "type": "space", "unit": "micrometer"},
-                 {"name": "y", "type": "space", "unit": "micrometer"},
-                 {"name": "x", "type": "space", "unit": "micrometer"},
-             ]}
-        ]
-    }
-    group = zarr.open_group(str(out), mode="a")
-    group.attrs.update(out_attrs)
+    # Root-level annotations only. The multiscales entry now belongs to the root
+    # itself (written above), so anything added here must not add or replace it.
     group.attrs["roi"] = {
         "z": list(z_range), "y": list(y_range), "x": list(x_range),
         "source": str(args.zarr),
         "channel": args.channel,
+    }
+    group.attrs["scene"] = {
+        "name": "ear1_1-6m ROI",
+        "description": "image and nuclei mask in absolute specimen coordinates",
+        "layers": ["image", "nuclei"] + (["spots"] if args.spots else []),
     }
 
     print()

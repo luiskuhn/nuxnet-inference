@@ -663,7 +663,7 @@ python scripts/check_ear_detections.py --zarr ear1_1-6m.lite.zarr --layer nuclei
 ```
 
 A matplotlib validation report with per-volume slice montages, per-slice Dice curves,
-threshold sweeps, the detection page and the ear pages is produced by
+threshold sweeps, the detection page and four ear pages is produced by
 `scripts/make_report.py`:
 
 ```console
@@ -676,6 +676,19 @@ python scripts/make_report.py --artifacts /path/to/eval-output --out report.pdf 
 The artifacts it expects are the `.prepared.npy`, `.truth_grid.npy`, `.prob.npy` files
 written by `scripts/eval_numorph.py`, plus its `summary.json`. The ear pages are optional
 and are skipped when their arguments are omitted.
+
+The four ear pages are: two of slices (four each, chosen by how many nuclei fall on them
+rather than by depth fraction, because evenly spaced slices land on empty planes), one of a
+max projection plus the same patch at three magnifications, and one overlaying the model
+mask with the Imaris spots. The slice pages run at 1092×1196 px per panel — a 690×630 slice
+is nearly square, so on portrait paper the only way to make panels larger is to put fewer
+of them on a page. The agreement page matches nuclei in 3D at 7.4 µm, the same rule as the
+pooled numbers, and reproduces precision 0.376 / recall 0.664 per plane. Matching per plane
+instead reads 0.17, because the two detectors place a nucleus's single-slice disc up to
+1.5 Z voxels apart.
+
+Pages are built from an explicit list, so the `n / total` footer cannot drift from the
+number of pages actually written; it did once, reporting 15 for a 16-page document.
 
 ---
 

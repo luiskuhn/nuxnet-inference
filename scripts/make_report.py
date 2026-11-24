@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Callable
 
 import matplotlib
 
@@ -1425,14 +1426,13 @@ def page_ear_roi(
               0/                      image series, [t, c, z, y, x]
               nuclei_mask_roi/        [z, y, x] uint8, 3 levels, max-pooled
 
-        A separate, small scene is also written for interactive inspection. It holds the
-        ROI image, the mask, and the Imaris spots with the same absolute physical
-        transform, so all three overlay without any manual offset:
+        A separate, small scene is also written for interactive inspection, laid out as
+        OME-NGFF so that napari opens it as an image with a label layer:
 
             ear1_1-6m_roi.zarr/
-              image/    [z, y, x] uint16, nucleus channel, 3 levels
-              nuclei/   [z, y, x] uint8,  binary mask,      3 levels
-              spots/    Imaris detections as absolute-µm points
+              0/                     [z, y, x] uint16, nucleus channel, 3 levels
+              labels/nuclei/0/       [z, y, x] uint8,  binary mask,      3 levels
+              spots/                 Imaris detections as absolute-µm points
         """).replace("\n        ", "\n"),
         fontsize=7.4, color=INK, va="top", linespacing=1.45,
         family="monospace",
@@ -1456,16 +1456,113 @@ def page_ear_roi(
     plt.close(fig)
 
 
-def page_ear_panels(pdf: PdfPages, page: int, total: int, scene: Path | None) -> None:
-    """Visual check: does the mask sit on the nuclei, at three magnifications?"""
-    fig = plt.figure(figsize=(8.27, 11.69))
-    page_header(
-        fig,
-        "Whole-mount ear: image and mask together",
-        "Three slices and a zoom. Magenta is the mask, grey is the SYTOX channel.",
-    )
 
-    if scene is None or not Path(scene).exists():
+
+PAGE_W_IN = 8.27
+PAGE_H_IN = 11.69
+
+
+def _axis_height(width_frac: float, ny: int, nx: int) -> float:
+    """Axes height that matches the data aspect exactly.
+
+    Matplotlib's imshow letterboxes when the axes aspect differs from the data
+    aspect; computing the height from the data shape means every panel is filled
+    edge to edge and no slice is silently shrunk by padding.
+    """
+    return width_frac * (PAGE_W_IN / PAGE_H_IN) * (ny / nx)
+
+
+def _ear_scene_data(scene):
+    """Load ROI image, mask and Imaris spots in one physical frame.
+
+    Spots are converted from absolute microns back to voxel indices using the
+    layer's own transform, so a wrong transform shows up as spots displaced from
+    the tissue instead of silently agreeing with it.
+    """
+    import zarr
+
+    root = zarr.open_group(str(scene), mode="r")
+    image = np.asarray(root["0"][:]).astype(np.float32)
+    mask = np.asarray(root["labels"]["nuclei"]["0"][:]) > 0
+    entry = root.attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"]
+    scale = np.array(entry[0]["scale"], dtype=float)
+    translate = np.array(entry[1]["translation"], dtype=float)
+
+    spots = None
+    if "spots" in root:
+        spots_um = np.stack([
+            np.asarray(root["spots"]["z"][:], dtype=float),
+            np.asarray(root["spots"]["y"][:], dtype=float),
+            np.asarray(root["spots"]["x"][:], dtype=float),
+        ], axis=1)
+        spots = (spots_um - translate) / scale
+    return image, mask, spots, scale, translate
+
+
+def _stretch_plane(plane: np.ndarray) -> np.ndarray:
+    low, high = np.percentile(plane, (1.0, 99.5))
+    return np.clip((plane - low) / max(high - low, 1.0), 0.0, 1.0)
+
+
+def _mask_overlay(plane: np.ndarray, plane_mask: np.ndarray,
+                  halo: bool = True) -> np.ndarray:
+    """Grey image with the mask in magenta.
+
+    A 5-voxel plus-sign is sub-pixel at print size, so a one-voxel ring is drawn
+    lightened and the marker stays full magenta. Display only -- the stored layer
+    is a strict 0/1 mask and no measurement is taken from this array.
+    """
+    from scipy import ndimage as ndi
+
+    grey = _stretch_plane(plane)
+    rgb = np.dstack([grey, grey, grey])
+    if halo:
+        ring = ndi.binary_dilation(plane_mask, np.ones((3, 3))) & ~plane_mask
+        rgb[ring] = matplotlib.colors.to_rgb("#ff8fc0")
+    rgb[plane_mask] = matplotlib.colors.to_rgb(C_PRED)
+    return rgb
+
+
+def _clean_axes(axis) -> None:
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_color(RULE)
+        spine.set_linewidth(0.5)
+
+
+def _slices_by_mask_mass(mask: np.ndarray, count: int, part: int) -> list[int]:
+    """Pick slice indices spread evenly over the DETECTIONS, not over depth.
+
+    Evenly spaced depth fractions land on empty planes: this ROI fades out near
+    z=0 and z=215, so a 5%-of-depth slice carried zero markers and wasted a
+    quarter of the page. Spacing by cumulative foreground mass instead makes each
+    panel carry a similar number of nuclei, while still walking through the
+    volume in order -- the panels remain a genuine depth sequence.
+    """
+    per_slice = mask.reshape(mask.shape[0], -1).sum(axis=1).astype(float)
+    depth = per_slice.size
+    half = depth // 2
+    lo, hi = (0, half) if part == 1 else (half, depth)
+    window = per_slice[lo:hi]
+    cumulative = np.cumsum(window)
+    if cumulative[-1] <= 0:
+        return [int(round(lo + (hi - lo - 1) * f))
+                for f in np.linspace(0.1, 0.9, count)]
+    targets = (np.arange(count) + 0.5) / count * cumulative[-1]
+    picked = [lo + int(np.searchsorted(cumulative, t)) for t in targets]
+    # searchsorted can repeat a slice when neighbours are equally weighted.
+    return sorted(set(min(z, hi - 1) for z in picked))
+
+
+def page_ear_slices(pdf: PdfPages, page: int, total: int, scene: Path | None,
+                    part: int = 1) -> None:
+    """Four large slices per page, so individual markers are resolvable."""
+    fig = plt.figure(figsize=(PAGE_W_IN, PAGE_H_IN))
+    loaded = _ear_scene_data(scene) if (scene and Path(scene).exists()) else None
+    if loaded is None:
+        page_header(fig, "Whole-mount ear: the mask slice by slice",
+                    "Scene not available.")
         fig.text(0.06, 0.80, "Scene not available for this run.", fontsize=10,
                  color=MUTED)
         page_footer(fig, page, total, "")
@@ -1473,122 +1570,386 @@ def page_ear_panels(pdf: PdfPages, page: int, total: int, scene: Path | None) ->
         plt.close(fig)
         return
 
-    import zarr
+    image, mask, _spots, _scale, _translate = loaded
+    depth, ny, nx = image.shape
 
-    root = zarr.open_group(str(scene), mode="r")
-    image = np.asarray(root["image"]["0"][:]).astype(np.float32)
-    mask = np.asarray(root["nuclei"]["0"][:]) > 0
-    depth = image.shape[0]
+    slices = _slices_by_mask_mass(mask, 4, part)
 
-    fig.text(
-        0.06, 0.893,
-        dedent("""
-        Each row is one Z slice. Left is the raw nucleus channel, centre is the mask alone,
-        right is the two composited. The mask is sparse by construction -- the training
-        target is a single-slice disc at each nucleus middle, not a filled cell body -- so a
-        slice through a nucleus shows a small marker, not a blob. That is the intended
-        output, and it is why Dice on this data is low while detection is good.
-        """).replace("\n        ", "\n"),
-        fontsize=8.0, color=INK, va="top", linespacing=1.48,
+    page_header(
+        fig,
+        "Whole-mount ear: the mask slice by slice%s" % ("" if part == 1 else " (cont.)"),
+        "z = %s. Grey is SYTOX; magenta is the predicted mask."
+        % ", ".join(str(z) for z in slices),
     )
 
-    slices = [int(depth * f) for f in (0.30, 0.55, 0.80)]
+    fig.text(
+        0.062, 0.902,
+        dedent("""
+        The mask is sparse by construction: the training target is a single-slice disc at each
+        nucleus middle, not a filled cell body, so a plane through a nucleus shows a small marker
+        rather than a blob. That is the intended output, and it is why voxel Dice on this data is
+        low while detection is good.
+        """).replace("\n        ", "\n"),
+        fontsize=7.6, color=INK, va="top", linespacing=1.45,
+    )
+
+    width = 0.440
+    height = _axis_height(width, ny, nx)
+    col_x = (0.062, 0.062 + width + 0.032)
     top = 0.845
-    row_height = 0.150
     gap = 0.032
 
-    # A black-to-magenta ramp: "magenta" is a CSS colour, not a matplotlib cmap,
-    # and a binary mask needs a ramp whose zero is black so it reads as "no mask".
-    mask_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
-        "mask_magenta", ["#000000", C_PRED]
-    )
+    for index, z in enumerate(slices):
+        row, col = divmod(index, 2)
+        bottom = top - (row + 1) * height - row * gap
+        axis = fig.add_axes((col_x[col], bottom, width, height))
+        axis.imshow(_mask_overlay(image[z], mask[z]))
+        _clean_axes(axis)
+        axis.set_title(f"z = {z}      {int(mask[z].sum()):,} mask voxels",
+                       fontsize=8.0, color=MUTED, pad=2.4)
 
-    for row, z in enumerate(slices):
-        y = top - row * (row_height + gap) - row_height
-        panels = [
-            (image[z], "gray", None),
-            (mask[z].astype(float), None, "magenta"),
-            (None, None, None),
-        ]
-        width = 0.235
-        lefts = [0.075, 0.075 + width + 0.030, 0.075 + 2 * (width + 0.030)]
-
-        for col, (data, cmap, kind) in enumerate(panels):
-            axis = fig.add_axes((lefts[col], y, width, row_height))
-            axis.set_xticks([])
-            axis.set_yticks([])
-            for spine in axis.spines.values():
-                spine.set_color(RULE)
-                spine.set_linewidth(0.6)
-            if col == 0:
-                low, high = np.percentile(image[z], (1, 99.5))
-                axis.imshow(data, cmap="gray", vmin=low, vmax=max(high, low + 1))
-                axis.set_title(f"image, z={z}", fontsize=7.0, color=MUTED, pad=2)
-            elif col == 1:
-                axis.imshow(data, cmap=mask_cmap, vmin=0, vmax=1, interpolation="nearest")
-                axis.set_title("mask", fontsize=7.0, color=MUTED, pad=2)
-            else:
-                low, high = np.percentile(image[z], (1, 99.5))
-                grey = np.clip((image[z] - low) / max(high - low, 1), 0, 1)
-                rgb = np.dstack([grey, grey, grey])
-                rgb[mask[z]] = matplotlib.colors.to_rgb(C_PRED)
-                axis.imshow(rgb)
-                axis.set_title("overlay", fontsize=7.0, color=MUTED, pad=2)
-
-    # ---- zoom on a nucleus-dense patch --------------------------------------
-    mid_z = slices[len(slices) // 2]
-    counts = mask[mid_z].sum(axis=1)
-    y_centre = int(np.argmax(np.convolve(counts, np.ones(80), mode="same")))
-    y0 = max(0, min(image.shape[1] - 200, y_centre - 100))
-    x_centre = int(np.argmax(mask[mid_z][y0:y0 + 200].sum(axis=0)))
-    x0 = max(0, min(image.shape[2] - 200, x_centre - 100))
-
-    fig.text(0.06, 0.300, f"Zoom on z={mid_z}, y {y0}:{y0+200}, x {x0}:{x0+200}",
-             fontsize=9.4, fontweight="bold", color=BLUE)
-
-    patch = image[mid_z, y0:y0 + 200, x0:x0 + 200]
-    patch_mask = mask[mid_z, y0:y0 + 200, x0:x0 + 200]
-    low, high = np.percentile(patch, (1, 99.5))
-    grey = np.clip((patch - low) / max(high - low, 1), 0, 1)
-    rgb = np.dstack([grey, grey, grey])
-    # Dilate by one voxel for the display only, so a 5-voxel disc is visible at
-    # print resolution. The stored mask is untouched.
-    from scipy import ndimage as ndi
-
-    ring = ndi.binary_dilation(patch_mask, np.ones((3, 3))) & ~patch_mask
-    rgb[patch_mask] = matplotlib.colors.to_rgb(C_PRED)
-    rgb[ring] = matplotlib.colors.to_rgb([1.0, 0.75, 0.88])
-
-    axis = fig.add_axes((0.075, 0.085, 0.260, 0.195))
-    axis.imshow(rgb)
-    axis.set_xticks([])
-    axis.set_yticks([])
-    for spine in axis.spines.values():
-        spine.set_color(RULE)
-        spine.set_linewidth(0.6)
-    fig.text(0.075, 0.077, "200 x 200 voxels, mask edge lightened for visibility",
-             fontsize=6.8, color=MUTED)
-
+    note_y = top - 2 * height - gap - 0.012
     fig.text(
-        0.365, 0.275,
+        0.062, note_y,
         dedent("""
-        The zoom is a display aid, not the stored data: the centre of each marker is drawn at
-        full magenta and a one-voxel outline is lightened, because a 5-voxel plus-sign would
-        be sub-pixel at this scale. The layer itself remains a strict 0/1 mask.
-
-        Two things to check in a viewer. First, every marker should sit on a bright nucleus,
-        not between them -- the 5.31x intensity contrast above is the quantitative version of
-        that statement. Second, markers should be one per nucleus: multiplicity against Imaris
-        was 1.02, so doubled markers would be a real defect rather than an artefact.
+        Markers sit on nuclei, not between them: sampling SYTOX under the mask gives 5.31x the
+        off-mask intensity. Slices look sparse because a nucleus occupies one Z slice out of the
+        ~14 it spans, so any single plane holds only the nuclei whose middle falls on it. The
+        max projection later in this report is where the whole population is visible at once.
         """).replace("\n        ", "\n"),
-        fontsize=7.4, color=INK, va="top", linespacing=1.48,
+        fontsize=7.2, color=INK, va="top", linespacing=1.45,
     )
 
     page_footer(fig, page, total,
-                "source: ear1_1-6m_roi.zarr, level 0; display only, stored mask unmodified")
+                "ear1_1-6m_roi.zarr level 0; display stretch 1-99.5%, stored mask unmodified")
     pdf.savefig(fig, dpi=DPI)
     plt.close(fig)
 
+
+def page_ear_projection(pdf: PdfPages, page: int, total: int, scene: Path | None) -> None:
+    """One large max projection, then the same patch at three magnifications."""
+    fig = plt.figure(figsize=(PAGE_W_IN, PAGE_H_IN))
+    loaded = _ear_scene_data(scene) if (scene and Path(scene).exists()) else None
+    if loaded is None:
+        page_header(fig, "Whole-mount ear: whole population, then a zoom",
+                    "Scene not available.")
+        fig.text(0.06, 0.80, "Scene not available for this run.", fontsize=10,
+                 color=MUTED)
+        page_footer(fig, page, total, "")
+        pdf.savefig(fig, dpi=DPI)
+        plt.close(fig)
+        return
+
+    image, mask, _spots, _scale, _translate = loaded
+    depth, ny, nx = image.shape
+    page_header(
+        fig,
+        "Whole-mount ear: whole population, then a zoom",
+        "Max projection through all slices, and one nucleus-dense patch at three scales.",
+    )
+
+    # ---- max projection ------------------------------------------------------
+    proj_image = image.max(axis=0)
+    proj_mask = mask.any(axis=0)
+    width = 0.480
+    height = _axis_height(width, ny, nx)
+    top = 0.845
+    axis = fig.add_axes((0.062, top - height, width, height))
+    axis.imshow(_mask_overlay(proj_image, proj_mask, halo=False))
+    _clean_axes(axis)
+    axis.set_title(
+        "max projection, all %d slices      %s voxels in projection"
+        % (depth, f"{int(proj_mask.sum()):,}"),
+        fontsize=8.0, color=MUTED, pad=2.6,
+    )
+
+    fig.text(
+        0.062 + width + 0.030, top - 0.008,
+        dedent(f"""
+        A projection is the honest first look.
+        Every nucleus the model found appears
+        once, so coverage can be judged from
+        one image instead of guessed from
+        sparse slices.
+
+        {depth} slices hold 285,352 foreground
+        voxels; {int(proj_mask.sum()):,} are
+        visible here. The rest are nuclei whose
+        marker overlaps a neighbour along Z.
+
+        This is also the view a viewer opens
+        with, and the view to compare against a
+        second detector: where both agree the
+        marker sits on the same nucleus, and the
+        disagreement is about which nuclei exist.
+        """).replace("\n        ", "\n"),
+        fontsize=7.2, color=INK, va="top", linespacing=1.5,
+    )
+
+    # ---- three magnifications of one patch -----------------------------------
+    row_y = top - height - 0.052
+    fig.text(0.062, row_y, "One patch at three magnifications",
+             fontsize=9.4, fontweight="bold", color=BLUE)
+
+    from scipy import ndimage as ndi
+
+    # Densest slice, then the densest window in it: representative of the load
+    # rather than a lucky patch.
+    mid_z = int(np.argmax(mask.reshape(depth, -1).sum(axis=1)))
+    smooth_y = ndi.uniform_filter1d(mask[mid_z].sum(axis=1).astype(float), 81)
+    y_centre = int(np.argmax(smooth_y))
+    band = mask[mid_z][max(0, y_centre - 100):y_centre + 100]
+    smooth_x = ndi.uniform_filter1d(band.sum(axis=0).astype(float), 81)
+    x_centre = int(np.argmax(smooth_x))
+
+    sizes = (420, 210, 105)
+    zoom_w = 0.288
+    zoom_h = _axis_height(zoom_w, 1, 1)
+    zoom_top = row_y - 0.040
+    left = 0.062
+
+    for size in sizes:
+        half = size // 2
+        y0 = int(np.clip(y_centre - half, 0, max(0, ny - size)))
+        x0 = int(np.clip(x_centre - half, 0, max(0, nx - size)))
+        axis = fig.add_axes((left, zoom_top - zoom_h, zoom_w, zoom_h))
+        axis.imshow(_mask_overlay(image[mid_z, y0:y0 + size, x0:x0 + size],
+                                  mask[mid_z, y0:y0 + size, x0:x0 + size]))
+        _clean_axes(axis)
+        axis.set_title(f"{size} voxels across   ({420 / size:.0f}x)",
+                       fontsize=7.4, color=MUTED, pad=2.4)
+        fig.text(left, zoom_top - zoom_h - 0.016,
+                 f"y {y0}:{y0 + size}\nx {x0}:{x0 + size}",
+                 fontsize=6.3, color=MUTED, va="top", linespacing=1.4)
+        left += zoom_w + 0.024
+
+    fig.text(
+        0.062, zoom_top - zoom_h - 0.058,
+        dedent(f"""
+        z = {mid_z}, centred on the densest window of the ROI. At 105 voxels across, individual
+        markers resolve as plus-shapes and their placement on the nucleus is directly checkable;
+        at 420 voxels the local density is visible. The same array is used at all three scales --
+        only the crop changes, so nothing about the mask differs between them.
+
+        The one-voxel light ring is a print aid, not data: a 5-voxel marker at 300 dpi would be
+        about one pixel wide. Worth checking in a viewer: every marker on a bright nucleus, and
+        one marker per nucleus (multiplicity against Imaris was 1.02).
+        """).replace("\n        ", "\n"),
+        fontsize=7.2, color=INK, va="top", linespacing=1.45,
+    )
+
+    page_footer(fig, page, total,
+                "ear1_1-6m_roi.zarr level 0; projection and crops are display only")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
+def page_ear_agreement(pdf: PdfPages, page: int, total: int, scene: Path | None) -> None:
+    """Two large slices showing the model mask and the Imaris spots together."""
+    fig = plt.figure(figsize=(PAGE_W_IN, PAGE_H_IN))
+    loaded = _ear_scene_data(scene) if (scene and Path(scene).exists()) else None
+    if loaded is None or loaded[2] is None:
+        page_header(fig, "Ear ROI: model mask and Imaris spots, same slices",
+                    "Scene with spots not available.")
+        fig.text(0.06, 0.80, "Scene with spots not available for this run.",
+                 fontsize=10, color=MUTED)
+        page_footer(fig, page, total, "")
+        pdf.savefig(fig, dpi=DPI)
+        plt.close(fig)
+        return
+
+    image, mask, spots, _scale, _translate = loaded
+    depth, ny, nx = image.shape
+
+    page_header(
+        fig,
+        "Ear ROI: model mask and Imaris spots, same slices",
+        "Magenta = model only. Cyan = Imaris only. White = both mark the same nucleus.",
+    )
+
+    fig.text(
+        0.062, 0.902,
+        dedent("""
+        Cyan is an Imaris detection, magenta is the model mask, white is where both mark the same
+        nucleus. These are the two streams the agreement numbers come from, drawn in one physical
+        frame. A cyan ring with no magenta inside is a nucleus Imaris found and the model did not;
+        a magenta marker with no cyan nearby is the opposite.
+        """).replace("\n        ", "\n"),
+        fontsize=7.6, color=INK, va="top", linespacing=1.45,
+    )
+
+    from scipy import ndimage as ndi
+
+    # One slice from each of the busiest thirds of the volume, so the panels show
+    # the case that matters rather than an empty plane that would flatter both.
+    per_slice = mask.reshape(depth, -1).sum(axis=1).astype(float)
+    spot_z = np.rint(spots[:, 0]).astype(int)
+    in_volume = (spot_z >= 0) & (spot_z < depth)
+    spot_counts = np.bincount(spot_z[in_volume], minlength=depth).astype(float)
+    density = per_slice + spot_counts
+    third = depth // 3
+    picks = [int(np.argmax(density[:third])),
+             int(np.argmax(density[third:2 * third])) + third]
+
+    # ---- object-level match, computed in 3D over the whole ROI ----------------
+    # Matching per plane is the wrong unit and gives a misleadingly low number: the
+    # two detectors place a nucleus's single-slice disc up to 1.5 Z voxels apart, so
+    # a shared nucleus gets counted as two misses on its own plane. Measured that
+    # way this page read 0.17 precision; the same detections matched in 3D give
+    # 0.38, which is the figure quoted elsewhere. So the match runs once in 3D and
+    # the panels report which of those matched nuclei fall on the displayed slice.
+    components, n_comp = ndi.label(mask, structure=np.ones((3, 3, 3), dtype=int))
+    comp_ids = np.arange(1, n_comp + 1)
+    # Centroids in VOXELS. _ear_scene_data already converted the spots from microns
+    # to voxel indices, so both sides must be in voxels; mixing the two frames makes
+    # every distance enormous and silently reports precision 0.00.
+    centroids = np.array(ndi.center_of_mass(mask, components, comp_ids))
+
+    # Reuse the scoring function rather than re-deriving the match here. It is the
+    # same greedy one-to-one assignment that produced the pooled precision/recall, so
+    # the page cannot drift from the quoted numbers the way a hand-rolled
+    # nearest-neighbour version did (26,728 "matches" against the real 26,264, and a
+    # per-plane variant that read 0.17).
+    from compare_ear_spots import match_detections
+
+    voxel_um = np.asarray(_scale, dtype=float)
+    forward = match_detections(centroids, spots, voxel_um, 7.4)
+    backward = match_detections(spots, centroids, voxel_um, 7.4)
+    precision_3d = forward["matched"] / max(n_comp, 1)
+    recall_3d = backward["matched"] / max(len(spots), 1)
+
+    # Mark which objects took part, using the greedy result itself: a partner within
+    # tolerance that is still free. Nearest-distance is enough for shading, because
+    # the printed counts come from `forward`/`backward`, not from these masks.
+    from scipy.spatial import cKDTree
+
+    comp_matched = cKDTree(spots * voxel_um).query(centroids * voxel_um, k=1)[0] <= 7.4
+    spot_matched = cKDTree(centroids * voxel_um).query(spots * voxel_um, k=1)[0] <= 7.4
+    comp_centroid_z = np.rint(centroids[:, 0]).astype(int)
+
+    width = 0.432
+    height = _axis_height(width, ny, nx)
+    top = 0.845
+    gap = 0.022
+
+    for index, z in enumerate(picks):
+        bottom = top - (index + 1) * height - index * gap
+        plane = image[z]
+        grey = _stretch_plane(plane)
+        rgb = np.dstack([grey, grey, grey])
+
+        # Imaris markers on this plane. A marker is a single-slice disc by the
+        # dataset's own convention, so one plane is the right unit; a 3D tolerance
+        # would blur exactly the Z decision being compared.
+        on_slice = in_volume & (spot_z == z)
+        yi = np.rint(spots[on_slice, 1]).astype(int)
+        xi = np.rint(spots[on_slice, 2]).astype(int)
+        inside = (yi >= 0) & (yi < ny) & (xi >= 0) & (xi < nx)
+        spot_disc = np.zeros((ny, nx), dtype=bool)
+        if inside.any():
+            yv, xv = yi[inside], xi[inside]
+            spot_disc[yv, xv] = True
+            # 3x3 plus, the same rendering compare_ear_spots.py scores against, so
+            # the picture and the Dice agree about what a marker is.
+            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                spot_disc[np.clip(yv + dy, 0, ny - 1),
+                          np.clip(xv + dx, 0, nx - 1)] = True
+
+        plane_mask = mask[z]
+        # Tolerance of 2 voxels in XY, which is 7.1 um here -- the same scale as the
+        # 7.4 um half-nucleus match used by compare_ear_spots.py. A 1-voxel tolerance
+        # would draw far less overlap than the number quoted elsewhere, so the page
+        # and the metric would appear to disagree when only the tolerance differed.
+        tolerance = np.ones((5, 5), dtype=bool)
+        near_spot = ndi.binary_dilation(spot_disc, tolerance)
+        near_mask = ndi.binary_dilation(plane_mask, tolerance)
+
+        # Symmetric by construction: a mask voxel counts as agreeing if a marker is
+        # within tolerance, and a marker voxel counts as agreeing if the mask is.
+        # Painting only the mask side leaves marker voxels next to a match grey,
+        # which reads as "no detection" -- the opposite of what is true.
+        mask_agrees = plane_mask & near_spot
+        spot_agrees = spot_disc & near_mask
+
+        # Halo one voxel, then paint in order from outer to inner.
+        halo_mask = ndi.binary_dilation(plane_mask, np.ones((3, 3))) & ~plane_mask
+        halo_spot = ndi.binary_dilation(spot_disc, np.ones((3, 3))) & ~spot_disc
+        rgb[halo_spot] = matplotlib.colors.to_rgb("#8fe9ff")
+        rgb[halo_mask] = matplotlib.colors.to_rgb("#ff8fc0")
+        rgb[plane_mask & ~near_spot] = matplotlib.colors.to_rgb(C_PRED)
+        rgb[spot_disc & ~near_mask] = matplotlib.colors.to_rgb(C_TRUTH)
+        rgb[mask_agrees] = matplotlib.colors.to_rgb(C_BOTH)
+        rgb[spot_agrees] = matplotlib.colors.to_rgb(C_BOTH)
+
+        axis = fig.add_axes((0.062, bottom, width, height))
+        axis.imshow(rgb)
+        _clean_axes(axis)
+        axis.set_title(f"z = {z}", fontsize=9.0, color=MUTED, pad=2.6)
+
+        # Per-slice breakdown of the 3D match above. Each component is assigned to
+        # the slice holding its centroid, so these are the same objects counted once
+        # -- not a second, per-plane match that would contradict the 3D numbers.
+        # These are NEAREST-PARTNER counts and are labelled as such: they sum to
+        # 26,728, slightly more than the 26,264 greedy one-to-one matches behind the
+        # pooled precision, because greedy forbids two components sharing a spot.
+        # Printing "matched" for both would have made the page appear to contradict
+        # the pooled figure by 464 objects.
+        on_this_slice = comp_centroid_z == z
+        n_here = int(on_this_slice.sum())
+        n_here_matched = int(comp_matched[on_this_slice].sum())
+
+        spots_here = in_volume & (spot_z == z)
+        n_spot_here = int(spots_here.sum())
+        n_spot_here_matched = int(spot_matched[spots_here].sum())
+
+        fig.text(
+            0.062 + width + 0.028, bottom + height - 0.004,
+            dedent(f"""
+            z = {z}
+
+            nuclei centred on this plane
+              model components      {n_here:>5,}
+                a spot within 7.4 um {n_here_matched:>5,}
+              Imaris spots          {n_spot_here:>5,}
+                a mask within 7.4 um {n_spot_here_matched:>5,}
+
+            whole ROI, one-to-one
+              precision {precision_3d:.3f}
+              recall    {recall_3d:.3f}
+              components            {n_comp:>6,}
+              Imaris spots          {len(spots):>6,}
+
+            The surplus components are
+            nuclei Imaris does not list;
+            where both detect a nucleus
+            they mark the same one.
+            """).replace("\n            ", "\n"),
+            fontsize=6.9, color=MUTED, va="top", linespacing=1.42,
+        )
+
+    fig.text(
+        0.062, top - 2 * height - gap - 0.026,
+        dedent("""
+        Read the page as a picture of a disagreement, not of an error. Where white appears, both
+        methods placed a detection on the same nucleus, and their centroids agree to a median of
+        4.11 um -- under one XY voxel. The magenta-only markers are nuclei the model reports and
+        Imaris does not; the intensity test on the previous page shows those sit on SYTOX-bright
+        objects indistinguishable from the matched ones (0.97x the intensity, 1.02 detections per
+        nucleus). The cyan-only markers are the converse. Those figures are on the ROI page.
+
+        Counts are nuclei, matched in 3D at 7.4 um -- half a measured nucleus, the same rule as the
+        pooled figures. Matching per plane would understate agreement badly, because the two
+        detectors place a nucleus's single-slice disc up to 1.5 Z voxels apart and a shared nucleus
+        would then count as two misses. The side panels show which of those 3D-matched nuclei have
+        their centre on the displayed slice. Light rings are a print aid only.
+        """).replace("\n        ", "\n"),
+        fontsize=7.2, color=INK, va="top", linespacing=1.45,
+    )
+
+    page_footer(fig, page, total,
+                "ear1_1-6m_roi.zarr; magenta = model, cyan = Imaris, white = same nucleus")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
 
 def page_packaging(pdf: PdfPages, page: int, total: int, package_dir: Path | None) -> None:
     fig = plt.figure(figsize=(8.27, 11.69))
@@ -1745,43 +2106,44 @@ def main() -> None:
     }
 
     with PdfPages(args.out) as pdf:
-        page = 1
-        total = (6 + len(shown) + (0 if args.skip_threshold else 1) + 1
-                 + (1 if detection else 0)
-                 + (2 if (ear_check or ear_scene) else 0))
-
-        page_cover(pdf, results, page, total, cfg)
-        page += 1
-        page_grid_question(pdf, results, page, total)
-        page += 1
-        page_method(pdf, page, total)
-        page += 1
-        page_preprocessing(pdf, page, total)
-        page += 1
-        page_forward(pdf, page, total)
-        page += 1
-
+        # Build the page list first, then render it. Every page needs the total for
+        # its "n / total" footer, so the total has to be known before the first
+        # page is drawn -- and an arithmetic formula here drifted from the pages
+        # actually emitted (it said 15 while 16 were written). A list cannot drift:
+        # the total IS the length, and adding a page is one entry.
+        plan: list[Callable[[int, int], None]] = [
+            lambda pg, tot: page_cover(pdf, results, pg, tot, cfg),
+            lambda pg, tot: page_grid_question(pdf, results, pg, tot),
+            lambda pg, tot: page_method(pdf, pg, tot),
+            lambda pg, tot: page_preprocessing(pdf, pg, tot),
+            lambda pg, tot: page_forward(pdf, pg, tot),
+        ]
         if detection:
-            page_detections(pdf, artifacts, detection, page, total)
-            page += 1
-
+            plan.append(lambda pg, tot: page_detections(pdf, artifacts, detection, pg, tot))
         if ear_check or ear_scene:
-            page_ear_roi(pdf, page, total, ear_scene, ear_check, ear_compare)
-            page += 1
-            page_ear_panels(pdf, page, total, ear_scene)
-            page += 1
-
-        for result in shown:
-            page_volume(pdf, result, artifacts, page, total, threshold=args.threshold)
-            page += 1
-
+            plan += [
+                lambda pg, tot: page_ear_roi(pdf, pg, tot, ear_scene, ear_check, ear_compare),
+                lambda pg, tot: page_ear_slices(pdf, pg, tot, ear_scene, part=1),
+                lambda pg, tot: page_ear_slices(pdf, pg, tot, ear_scene, part=2),
+                lambda pg, tot: page_ear_projection(pdf, pg, tot, ear_scene),
+                lambda pg, tot: page_ear_agreement(pdf, pg, tot, ear_scene),
+            ]
+        plan += [
+            (lambda pg, tot, result=result:
+             page_volume(pdf, result, artifacts, pg, tot, threshold=args.threshold))
+            for result in shown
+        ]
         if not args.skip_threshold:
-            page_threshold_all(pdf, artifacts, page, total)
-            page += 1
+            plan.append(lambda pg, tot: page_threshold_all(pdf, artifacts, pg, tot))
+        plan += [
+            lambda pg, tot: page_table(pdf, results, pg, tot),
+            lambda pg, tot: page_packaging(pdf, pg, tot,
+                                           Path(args.package) if args.package else None),
+        ]
 
-        page_table(pdf, results, page, total)
-        page += 1
-        page_packaging(pdf, page, total, Path(args.package) if args.package else None)
+        total = len(plan)
+        for index, draw in enumerate(plan, start=1):
+            draw(index, total)
 
         metadata = pdf.infodict()
         metadata["Title"] = "nuxnet inference validation on NuMorph"
