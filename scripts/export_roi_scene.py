@@ -180,7 +180,8 @@ def verify_scene(out: Path, expected_mask_foreground: int | None) -> None:
 
 def write_group(parent, name: str | None, levels: list[np.ndarray],
                 scale, translation, level_scales, colour: str, label: str,
-                compressor, ngff_type: str = "gaussian") -> None:
+                compressor, ngff_type: str = "gaussian",
+                window: tuple[float, float] | None = None) -> None:
     """Write one multiscale image into `parent`, optionally under a child group.
 
     `name=None` writes the arrays directly into `parent`, which is what an OME-NGFF
@@ -188,6 +189,11 @@ def write_group(parent, name: str | None, levels: list[np.ndarray],
     multiscales metadata and the numbered array levels. A root that instead holds
     child groups with the arrays inside them is not an image to a reader, and
     napari-ome-zarr returns zero layers for it.
+
+    `window` is the display range a viewer applies on open. It must come from the
+    data, not from a constant: this channel spans 0..22815, and a hardcoded 0..1
+    window clips every value above 1 to pure white, so the image opens as a
+    saturated black-and-white blob rather than a intensity image.
     """
     node = parent if name is None else parent.require_group(name)
     node.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
@@ -208,9 +214,11 @@ def write_group(parent, name: str | None, levels: list[np.ndarray],
     entry = axis_metadata(scale, translation, (0, 0, 0), level_scales, name=label)
     entry["type"] = ngff_type
     node.attrs["multiscales"] = [entry]
+    start, end = window if window is not None else (0.0, 1.0)
     node.attrs["omero"] = {
         "channels": [{"color": colour, "label": label,
-                      "window": {"start": 0, "end": 1, "min": 0, "max": 1}}]
+                      "window": {"start": float(start), "end": float(end),
+                                 "min": float(start), "max": float(end)}}]
     }
 
 
@@ -314,20 +322,31 @@ def main() -> None:
     image_levels = pyramid(image, args.levels, reducer="mean")
     level_scales = [[s * (2 ** level) for s in scale]
                     for level in range(len(image_levels))]
+
+    # Display window from the data. A hardcoded 0..1 clips this channel (0..22815)
+    # to pure white on open. The 99.5th percentile as the top is the same stretch
+    # open_layers.py uses for the normalised display: a few hot voxels would
+    # otherwise push every nucleus into the dark end.
+    image_window = (float(np.percentile(image, 1.0)),
+                    float(np.percentile(image, 99.5)))
+    print(f"image window      {image_window[0]:.0f}..{image_window[1]:.0f} "
+          f"(1st..99.5th percentile)")
     write_group(group, None, image_levels, scale, translation, level_scales,
-                "FFFFFF", "nuclei (SYTOX)", image_compressor)
+                "FFFFFF", "nuclei (SYTOX)", image_compressor,
+                window=image_window)
 
     # ---- mask as a label image ----------------------------------------------
     # Nested under labels/, not beside the image. That is the OME-NGFF place for a
     # segmentation of an image, and it is what tells a reader to overlay rather than
-    # open a second, unrelated image.
+    # open a second, unrelated image. A binary layer's window is 0..1 by definition.
     if mask is not None:
         print("writing mask levels...")
         labels = group.require_group("labels")
         labels.attrs["labels"] = ["nuclei"]
         mask_levels = pyramid(mask.astype(np.uint8), args.levels, reducer="max")
         write_group(labels, "nuclei", mask_levels, scale, translation, level_scales,
-                    "FF00FF", "nuclei mask", compressor, ngff_type="label")
+                    "FF00FF", "nuclei mask", compressor, ngff_type="label",
+                    window=(0.0, 1.0))
 
     # ---- optional spots ------------------------------------------------------
     if args.spots:
