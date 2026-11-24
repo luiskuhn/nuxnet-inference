@@ -279,3 +279,71 @@ def test_viewer_helpers_keep_the_stored_contrast_window(tmp_path):
     assert images[0]["channel_axis"] == 0
     # Only the marked channel starts visible.
     assert images[0]["visible"] == [True, False]
+
+
+def test_viewer_helpers_show_the_finest_level_in_both_2d_and_3d(tmp_path):
+    """Native resolution in 2D *and* 3D, which needs a single-level layer.
+
+    napari chooses levels differently per mode. In 2D it takes the coarsest level that
+    still exceeds the canvas (layer_utils.compute_multiscale_level), so fit-zoom is
+    already native. But base.py does this unconditionally for 3D:
+
+        # set the data_level so that it is the lowest resolution in 3d view
+        if self.multiscale is True:
+            self._data_level = len(self.level_shapes) - 1
+
+    Every 3D render therefore used the coarsest level and cannot be overridden, because
+    _update_draw resets it on each redraw. With 3 levels that showed (54, 172, 157),
+    1.6% of the voxels, upsampling back at 83% mean relative error -- the blurred look.
+
+    Handing napari only the finest level makes multiscale False, so data_level stays 0
+    in both modes. This asserts on the layer's actual data_level and shape rather than
+    on the store having a pyramid.
+    """
+    pytest.importorskip("napari")
+    import numpy as np
+
+    napari = pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from scripts.export_roi_scene import open_store, write_group
+    from numcodecs import Blosc
+
+    store = tmp_path / "scene.zarr"
+    group = open_store(store, mode="w")
+    data = np.zeros((2, 8, 16, 16), np.uint16)
+    data[0, 2:5, 4:8, 4:8] = 20000
+    data[1, 2:5, 8:12, 8:12] = 900
+    # A deliberately multi-level image: the helper must pick level 0 out of it.
+    coarse = data[:, :4, :8, :8]
+    write_group(
+        group, None, [data, coarse], (5.0, 3.5, 3.5), (0.0, 0.0, 0.0),
+        [(5.0, 3.5, 3.5), (10.0, 7.0, 7.0)], "FFFFFF", "nuclei",
+        compressor=Blosc(cname="zstd", clevel=5, shuffle=0),
+        channel_labels=["Nuclei [MODEL INPUT]", "Veins"],
+        channel_colours=["05FF02", "FF0605"],
+        channel_windows=[(0.0, 400.0), (0.0, 900.0)],
+    )
+
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location(
+        "scene_helper", pathlib.Path(__file__).parent.parent / "open_ear_scene.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    for ndisplay in (2, 3):
+        v = ViewerModel(ndisplay=ndisplay)
+        for kind, payload, kwargs in helper.build_layers(store):
+            {"image": v.add_image, "labels": v.add_labels,
+             "points": v.add_points}[kind](payload, **kwargs)
+        images = [l for l in v.layers if type(l).__name__ == "Image"]
+        assert images, "expected an image layer"
+        for layer in images:
+            assert layer.multiscale is False, (
+                f"ndisplay={ndisplay}: a multiscale layer lets napari pick a coarse "
+                "level, and in 3D it always picks the coarsest"
+            )
+            assert layer.data_level == 0
+            # The finest level, i.e. the full 16x16 plane, not the 8x8 coarse one.
+            assert layer.data.shape == (8, 16, 16), (
+                f"ndisplay={ndisplay}: showed {layer.data.shape}, not the finest level"
+            )

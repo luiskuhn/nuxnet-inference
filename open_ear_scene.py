@@ -77,15 +77,37 @@ def build_layers(scene: Path = SCENE):
                 if not any(kwargs["visible"]):
                     kwargs["visible"][0] = True
 
+        # Keep ONLY the finest level. This is what makes 3D usable.
+        #
+        # napari's rule for 2D is "coarsest level that still exceeds the canvas"
+        # (layer_utils.compute_multiscale_level), so zoomed out it shows level 1 or 2
+        # -- reasonable, and at fit-zoom on a 690x630 plane it already picks level 0.
+        # But for 3D base.py does this unconditionally:
+        #
+        #     # set the data_level so that it is the lowest resolution in 3d view
+        #     if self.multiscale is True:
+        #         self._data_level = len(self.level_shapes) - 1
+        #
+        # So every 3D render uses the COARSEST level, and there is no way to override
+        # it from outside: _update_draw resets it on each redraw. With 3 levels that
+        # was level 2 = (54, 172, 157), 1.6% of the voxels, and upsampled back it
+        # differs from native by 83% mean relative error -- the blurred look.
+        #
+        # Handing napari a single level makes multiscale False, so data_level is 0
+        # in both 2D and 3D and every view is native. The arrays stay lazy (zarr
+        # backed), so this costs nothing until a slice is read: 0.5 s / 188 MB for
+        # one channel, and only the marker starts visible.
+        finest = data[0] if isinstance(data, (list, tuple)) else data
+
         # A label layer takes a discrete label->colour mapping, not an image colormap,
         # so it keeps only the transform. Its `omero` window is 0..1, which is already
         # the right stretch for a binary mask.
         if layer_type == "labels" or "mask" in str(name).lower():
             label_kwargs = {k: v for k, v in kwargs.items()
                             if k in ("name", "scale", "translate", "opacity", "visible")}
-            specs.append(("labels", data, label_kwargs))
+            specs.append(("labels", finest, label_kwargs))
         else:
-            specs.append(("image", data, kwargs))
+            specs.append(("image", finest, kwargs))
 
     root = zarr.open_group(str(scene), mode="r")
 
