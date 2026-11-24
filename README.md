@@ -362,8 +362,14 @@ below any threshold when you zoom out, which reads as missing detections.
 To inspect it, with `[z, y, x]` layers already sharing a physical frame:
 
 ```bash
-napari /data/ear1_1-6m.lite.zarr
+napari --plugin napari-ome-zarr /data/ear1_1-6m.lite.zarr/0
 ```
+
+Two things in that command are load-bearing. The `/0` is the image *series* group: the
+store root holds a bioformats2raw layout, and the root itself has no `axes`, so opening the
+root raises `KeyError: 'axes'`. And `--plugin napari-ome-zarr` is required, because napari's
+own builtin reader also claims `*.zarr`; without the flag napari raises
+`MultipleReaderError` naming both candidates rather than guessing.
 
 If you would rather have a small, self-contained scene — for example to copy to a laptop —
 `scripts/export_roi_scene.py` writes one with the image, the mask and (optionally) the
@@ -371,14 +377,36 @@ detections, all in absolute specimen coordinates:
 
 ```bash
 python scripts/export_roi_scene.py \
-    --zarr /data/ear1_1-6m.lite.zarr --layer nuclei_mask \
+    --zarr /data/ear1_1-6m.lite.zarr --layer nuclei_mask_roi \
     --out ear1_1-6m_roi.zarr --spots roi_crop.spots.npz \
     --z-range 48:264 --y-range 1480:2170 --x-range 400:1030
 ```
 
 ```bash
-napari ear1_1-6m_roi.zarr
+napari --plugin napari-ome-zarr ear1_1-6m_roi.zarr
 ```
+
+### Chunk keys must be nested, and getting it wrong is silent
+
+OME-NGFF 0.2 moved chunk keys from flat (`0.0.0`) to nested (`0/0/0`), and `ome_zarr` —
+which napari-ome-zarr uses for every store it reads — hardcodes `dimension_separator="/"`
+when it opens one (`FormatV02.init_store`). Write flat chunks and read nested keys, and
+every chunk lookup misses. zarr answers a miss with `fill_value` instead of raising, so the
+read **succeeds and returns zeros**.
+
+That is the worst failure shape available: the store has the right shape, the right dtype,
+the right multiscales metadata and the right transforms, napari reports the expected number
+of layers with matching scale and translation, and the canvas is empty. Nothing errors.
+
+So `export_roi_scene.py` pins `dimension_separator="/"` on the store it writes, and
+`verify_scene()` then reads the result back through `ome_zarr` and fails if the image or
+mask is all zeros, if the mask foreground count differs from the source, or if the mask does
+not sit on brighter pixels than background. Checking shapes is what let a blank store pass
+before; the check has to be on content. `tests/test_scene_export.py` pins both directions:
+flat chunks read as zeros, nested chunks round-trip, and a blank-but-valid store raises.
+
+Note this affects reading *any* flat-chunk store with this toolchain, including a
+bioformats2raw export produced elsewhere — not just this scene.
 
 ---
 

@@ -111,6 +111,73 @@ def pyramid(volume: np.ndarray, levels: int, reducer: str) -> list[np.ndarray]:
     return out
 
 
+def open_store(out: Path, mode: str = "a"):
+    """Open the scene on a store that writes NESTED chunk keys, ``0/1/2/3``.
+
+    This is not a cosmetic choice, and getting it wrong is silent.
+
+    OME-NGFF 0.2 moved chunk keys from flat (``0.0.0``) to nested (``0/0/0``), and
+    ``ome_zarr`` -- which napari-ome-zarr uses to read every store -- hardcodes
+    ``dimension_separator="/"`` when it opens one (``FormatV02.init_store``). If the
+    chunks on disk are flat but the reader looks them up nested, every lookup misses
+    and zarr answers with ``fill_value``. For these arrays that is 0, so a viewer
+    shows a correct-looking, correctly-shaped, completely blank image. No exception,
+    no warning, no truncation: the read simply succeeds and reports zeros.
+
+    ``zarr.open_group(path)`` does not infer the separator from the ``.zarray`` on
+    read in this version, so the store has to carry it.
+    """
+    from zarr.storage import FSStore
+
+    import zarr
+
+    return zarr.open_group(
+        store=FSStore(str(out), mode=mode, dimension_separator="/", auto_mkdir=True),
+        mode=mode,
+    )
+
+
+def verify_scene(out: Path, expected_mask_foreground: int | None) -> None:
+    """Read the scene back the way napari does and fail if it is blank.
+
+    Checking shapes is what let a broken store look finished: the shape and dtype
+    were right and every voxel was zero. So this asserts on *content*, through the
+    same reader a viewer uses.
+    """
+    from ome_zarr.io import parse_url
+    from ome_zarr.reader import Reader
+
+    nodes = [n for n in Reader(parse_url(str(out)))() if n.data]
+    if len(nodes) < 2:
+        raise SystemExit(f"verify: expected image and mask, reader returned {len(nodes)}")
+
+    image = np.asarray(nodes[0].data[0][:])
+    if image.max() == 0:
+        raise SystemExit(
+            "verify: the image reads as all zeros. The store probably uses flat "
+            "chunk keys (0.0.0) while the reader expects nested ones (0/0/0)."
+        )
+    print(f"verify image      {image.shape}  range {image.min()}..{image.max()}")
+
+    mask = np.asarray(nodes[1].data[0][:])
+    foreground = int((mask > 0).sum())
+    if foreground == 0:
+        raise SystemExit("verify: the mask reads as all zeros")
+    if expected_mask_foreground is not None and foreground != expected_mask_foreground:
+        raise SystemExit(
+            f"verify: mask foreground {foreground:,} != expected "
+            f"{expected_mask_foreground:,}; the pyramid or crop is wrong"
+        )
+    print(f"verify mask       {mask.shape}  foreground {foreground:,}")
+
+    under = image[mask > 0].mean()
+    off = image[mask == 0].mean()
+    ratio = under / off if off else float("inf")
+    print(f"verify intensity  under mask {under:.0f} vs elsewhere {off:.0f} = {ratio:.2f}x")
+    if ratio <= 1.0:
+        raise SystemExit("verify: the mask does not sit on brighter pixels than background")
+
+
 def write_group(parent, name: str | None, levels: list[np.ndarray],
                 scale, translation, level_scales, colour: str, label: str,
                 compressor, ngff_type: str = "gaussian") -> None:
@@ -127,9 +194,11 @@ def write_group(parent, name: str | None, levels: list[np.ndarray],
 
     for level, data in enumerate(levels):
         chunk = tuple(min(int(c), 64) for c in data.shape)
+        # dimension_separator="/" so the chunk keys land nested (0/1/2), matching
+        # what ome_zarr hardcodes when it opens the store. See open_store().
         array = node.create_dataset(
             str(level), data=data, chunks=chunk, compressor=compressor,
-            overwrite=True, fill_value=0,
+            overwrite=True, fill_value=0, dimension_separator="/",
         )
         array.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
 
@@ -235,7 +304,7 @@ def main() -> None:
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
     image_compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
-    group = zarr.open_group(str(out), mode="a")
+    group = open_store(out, mode="a")
 
     # ---- image at the ROOT ---------------------------------------------------
     # OME-NGFF: the root group of an image store holds the multiscales metadata and
@@ -282,7 +351,7 @@ def main() -> None:
             local[:, 1] * scale[1] + translation[1],
             local[:, 2] * scale[2] + translation[2],
         ], axis=1)
-        group = zarr.open_group(str(out), mode="a")
+        group = open_store(out, mode="a")
         node = group.require_group("spots")
         node.create_dataset("z", data=physical[:, 0].astype(np.float32), overwrite=True)
         node.create_dataset("y", data=physical[:, 1].astype(np.float32), overwrite=True)
@@ -313,6 +382,10 @@ def main() -> None:
     print(f"wrote {out}")
     for child in sorted(p.name for p in out.iterdir()):
         print(f"  {child}")
+
+    # Read it back through the reader a viewer uses, and fail loudly if blank.
+    print()
+    verify_scene(out, int(mask.sum()) if mask is not None else None)
 
 
 if __name__ == "__main__":
