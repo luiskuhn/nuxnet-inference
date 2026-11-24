@@ -155,15 +155,29 @@ def open_level(store: str, level: str = "0"):
     root = zarr.open_group(store, mode="r")
 
     # bioformats2raw layout: groups "0", "1", ... each carrying a multiscales attr.
-    if level in root:
-        series = root[level]
-        metadata = dict(series.attrs.get("multiscales", [{}])[0])
-        return series["0"], metadata, series
+    #
+    # Membership alone is not enough to distinguish the two layouts. A store whose
+    # multiscales sits on the ROOT group has an *array* called "0", and
+    # ``"0" in root`` is equally true there, so the test used to take this branch
+    # and then index into that array looking for a child "0" -- which fails with
+    # "invalid 'fields' argument". Require the entry to be a group that actually
+    # declares multiscales before treating the store as bioformats2raw-shaped.
+    candidate = root[level] if level in root else None
+    if hasattr(candidate, "attrs") and not hasattr(candidate, "shape") \
+            and candidate.attrs.get("multiscales"):
+        metadata = dict(candidate.attrs["multiscales"][0])
+        if "0" in candidate:
+            return candidate["0"], metadata, candidate
 
     # Single-level layout: multiscales sits on the root group itself.
     metadata = dict(root.attrs.get("multiscales", [{}])[0])
     if not metadata:
         raise SystemExit(f"no multiscales metadata found in {store}")
+    # Merge the sibling `omero` block in. Channel names live there, not inside
+    # multiscales, and `--channel CD8` resolves against `metadata["omero"]`. Copy
+    # rather than alias so callers cannot accidentally mutate store attributes.
+    if root.attrs.get("omero"):
+        metadata["omero"] = dict(root.attrs["omero"])
     return root["0"], metadata, root
 
 
@@ -387,7 +401,14 @@ def write_multiscales(group, name: str, scale_zyx, translation_zyx,
     ``levels`` must be the number of datasets actually present. Listing a level
     that has not been written yet makes the store unreadable by ngff-validating
     viewers, so the attribute is rewritten after the pyramid is built.
+
+    ``type`` is ``label``, not ``gaussian``: this is a discrete label image, and
+    the ngff spec uses that field to tell a viewer to apply a label colormap
+    rather than a continuous one. ``name`` is the leaf, so a nested layer such as
+    ``labels/nuclei`` is called "nuclei" in a viewer's layer list rather than
+    "labels/nuclei".
     """
+    leaf = name.rsplit("/", 1)[-1]
     datasets = []
     for level in range(levels):
         lscale = [float(s) * (2 ** level) for s in scale_zyx]
@@ -400,16 +421,16 @@ def write_multiscales(group, name: str, scale_zyx, translation_zyx,
         })
     group.attrs["multiscales"] = [{
         "version": "0.4",
-        "name": name,
+        "name": leaf,
         "axes": mask_axes(),
         "datasets": datasets,
-        "type": "gaussian",
+        "type": "label",
         "metadata": {"method": "nuxnet-inference sliding-window, thresholded"},
     }]
     # A binary mask with a sane display window and a colour that reads on grey.
     group.attrs["omero"] = {
         "channels": [{
-            "label": name,
+            "label": leaf,
             "color": "FF00FF",
             "window": {"start": 0, "end": 1, "min": 0, "max": 1},
         }],
@@ -418,14 +439,15 @@ def write_multiscales(group, name: str, scale_zyx, translation_zyx,
 
 def ensure_mask_group(store: str, name: str, shape, scale_zyx, translation_zyx,
                       chunk, fresh: bool):
-    """Open or create the mask group's level 0 array at the store root.
+    """Open or create the mask group's level 0 array inside the store.
 
-    Deliberately a sibling of the image's series group, not a child of it. A
-    mask nested inside the image group is not a valid OME-NGFF multiscale image
-    in its own right, and readers that walk the store cannot offer it as a
-    separate layer. At the root, ``<store>/<name>`` is a self-contained
-    multiscale image and every OME-Zarr-aware viewer can load it alongside the
-    original image.
+    ``name`` may be a nested path such as ``labels/nuclei``. OME-NGFF puts label
+    images under a ``labels`` group with a sibling ``labels`` attribute, and
+    napari-ome-zarr only offers them as addable layers when that convention is
+    followed. A nested path is also deliberately NOT inside the image series
+    group: ``<store>/labels/<name>`` is a self-contained multiscale image in its
+    own right, so it opens as a separate layer instead of being mistaken for a
+    level of the intensity image.
     """
     import zarr
 
@@ -445,6 +467,16 @@ def ensure_mask_group(store: str, name: str, shape, scale_zyx, translation_zyx,
             f"existing layer {name!r} has shape {array.shape}, this run needs {shape}; "
             f"rerun with --fresh to replace it"
         )
+    # Declare the label so readers treat it as an instance/semantic label image
+    # rather than another intensity channel. Without this the mask opens with a
+    # continuous colormap and every nucleus looks like a different shade.
+    if "/" in name:
+        parent_path, label = name.rsplit("/", 1)
+        parent = root[parent_path]
+        declared = list(parent.attrs.get("labels", []))
+        if label not in declared:
+            declared.append(label)
+            parent.attrs["labels"] = declared
     # Level 0 only for now; the pyramid builder adds the rest and then restates
     # the attribute so it never advertises a level that is not on disk.
     write_multiscales(group, name, scale_zyx, translation_zyx, levels=1)

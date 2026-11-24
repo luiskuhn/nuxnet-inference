@@ -71,12 +71,35 @@ def voxel_size_from_ome(ome_metadata: str | None) -> np.ndarray | None:
     return size if np.all(size > 0) else None
 
 
-def normalize_minmax(volume: np.ndarray) -> np.ndarray:
-    """Per-volume min-max, as the trainer's ``normalize_input`` applied it."""
-    low, high = float(volume.min()), float(volume.max())
+def normalize_minmax(
+    volume: np.ndarray,
+    value_range: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Min-max to 0..1, using the trainer's per-volume range unless one is given.
+
+    Training normalized each volume by its own min/max, so with no ``value_range``
+    this is exactly what the trainer did. Passing ``value_range`` pins the mapping
+    to a fixed bracket instead.
+
+    That matters when a large volume is processed in pieces. Each piece has its own
+    min/max, so identical tissue lands on a different part of the 0..1 curve
+    depending on which piece it fell into, and with the model's threshold fixed the
+    same nucleus can be foreground in one chunk and background in the next.
+    Measured on the ear ROI, normalizing two halves separately dropped Dice between
+    the tiled and untiled result to 0.458. One range derived from the whole region
+    and reused for every chunk is what makes tiling invisible in the output.
+    """
+    if value_range is None:
+        low, high = float(volume.min()), float(volume.max())
+    else:
+        low, high = (float(v) for v in value_range)
     if high <= low:
         return np.zeros_like(volume, dtype=np.float32)
-    return ((volume - low) / (high - low)).astype(np.float32)
+    # Clip, because a pinned range may not cover this chunk's extremes: a chunk
+    # holding one unusually bright object would otherwise push everything else
+    # below the range the other chunks were mapped with.
+    scaled = (volume.astype(np.float32) - low) / (high - low)
+    return np.clip(scaled, 0.0, 1.0).astype(np.float32)
 
 
 def apply_training_pipeline(
@@ -84,6 +107,7 @@ def apply_training_pipeline(
     source_voxel_size_um: Sequence[float] | None,
     target_voxel_size_um: Sequence[float] = DEFAULT_TARGET_VOXEL_SIZE_UM,
     normalize: bool = True,
+    normalization_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Resample one volume to the training grid and normalize it.
 
@@ -125,8 +149,12 @@ def apply_training_pipeline(
 
     details["prepared_shape_zyx"] = [int(v) for v in working.shape]
     if normalize:
-        working = normalize_minmax(working)
-        details["normalized"] = "minmax, per volume"
+        working = normalize_minmax(working, value_range=normalization_range)
+        details["normalized"] = (
+            "minmax, per volume" if normalization_range is None
+            else f"minmax, shared range {normalization_range[0]:g}.."
+                 f"{normalization_range[1]:g}"
+        )
     else:
         details["normalized"] = False
     return working, details

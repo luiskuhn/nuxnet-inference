@@ -22,6 +22,7 @@ from nuxnet_inference_package.preprocessing import (
     REQUIRED_SIZE_MULTIPLE,
     _hann,
     _window_starts,
+    apply_training_pipeline,
     normalize_minmax,
     sliding_window_predict,
     voxel_size_from_ome,
@@ -72,6 +73,56 @@ def test_normalize_minmax_matches_trainer() -> None:
 def test_normalize_constant_volume_is_zeros() -> None:
     out = normalize_minmax(np.full((2, 3, 3), 7.0, dtype=np.float32))
     assert np.all(out == 0.0)
+
+
+def test_shared_range_maps_identical_tissue_identically() -> None:
+    """Two chunks containing the same tissue must normalize the same way.
+
+    This is the bug that made tiled output differ from untiled: each chunk derived
+    its own min/max, so a nucleus's brightness depended on its neighbours' extremes.
+    """
+    # The same 100-voxel value sits in two chunks whose brightest neighbour differs.
+    # Per-chunk min-max maps it to 0.5 in one and to 0.2 in the other.
+    chunk_a = np.array([[[0.0, 100.0, 200.0]]], dtype=np.float32)
+    chunk_b = np.array([[[0.0, 100.0, 500.0]]], dtype=np.float32)
+
+    per_chunk_a = normalize_minmax(chunk_a)
+    per_chunk_b = normalize_minmax(chunk_b)
+    assert per_chunk_a[0, 0, 1] == pytest.approx(0.5)
+    assert per_chunk_b[0, 0, 1] == pytest.approx(0.2)
+    assert not np.allclose(per_chunk_a, per_chunk_b), (
+        "per-chunk min-max is supposed to differ -- that is the failure mode"
+    )
+
+    # With one shared range the same intensity maps to the same value in both.
+    shared = (0.0, 500.0)
+    out_a = normalize_minmax(chunk_a, value_range=shared)
+    out_b = normalize_minmax(chunk_b, value_range=shared)
+    assert out_a[0, 0, 1] == pytest.approx(0.2)
+    assert out_b[0, 0, 1] == pytest.approx(0.2)
+
+
+def test_shared_range_clips_values_outside_it() -> None:
+    """A pinned range must not let one bright object rescale the chunk."""
+    volume = np.array([[[0.0, 50.0, 500.0]]], dtype=np.float32)
+    out = normalize_minmax(volume, value_range=(0.0, 100.0))
+    assert out.min() == 0.0
+    assert out[0, 0, 1] == pytest.approx(0.5)
+    assert out[0, 0, 2] == 1.0, "values above the range clip to 1, not to 5.0"
+
+
+def test_shared_range_reaches_pipeline() -> None:
+    """The pinned range must actually be used by the training pipeline, not dropped."""
+    volume = np.full((4, 8, 8), 10.0, dtype=np.float32)
+    volume[:, :, :4] = 20.0
+    _, details = apply_training_pipeline(
+        volume,
+        source_voxel_size_um=None,  # no resampling, so prepared == input
+        normalize=True,
+        normalization_range=(0.0, 40.0),
+    )
+    assert "shared range" in str(details["normalized"])
+    assert "0..40" in str(details["normalized"])
 
 
 # ---------------------------------------------------------------------------

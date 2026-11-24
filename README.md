@@ -45,6 +45,7 @@ This repository ships:
 - [Training-grid inference in detail](#training-grid-inference-in-detail)
 - [Post-processing for nuclei localization (TSV export)](#post-processing-for-nuclei-localization-tsv-export)
 - [Validation on the NuMorph training dataset](#validation-on-the-numorph-training-dataset)
+- [Validation on external annotated data (SELMA3D)](#validation-on-external-annotated-data-selma3d)
 - [Checkpoint compatibility and architecture parity](#checkpoint-compatibility-and-architecture-parity)
 - [BioImage.IO packaging](#bioimageio-packaging)
 - [Docker](#docker)
@@ -332,6 +333,14 @@ different contrast depending on where it landed. Measured: splitting a region an
 normalizing each part separately changed ~1% of voxels and dropped Dice between tiled and
 untiled results to **0.458**. The chunker therefore derives one range for the whole region
 and passes it to every chunk via `--normalization-range`.
+
+That flag is the chunker's requirement on the CLI, and it had to be added rather than
+assumed: `--normalization-range` was documented here and passed by the chunker from the
+start, but the `predict` subcommand did not declare it, so a chunked run failed with
+"No such option". It is now a real option that pins `normalize_minmax` to a fixed bracket
+instead of deriving one from the volume, and clips values outside it — a chunk holding one
+unusually bright object must not be rescaled against itself. `tests/test_preprocessing.py`
+guards both behaviours.
 
 **`--halo` is context, not overlap.** `--overlap` is the CLI's internal sliding-window
 overlap *inside* one chunk. `--halo` grows each chunk outward so the network sees a full
@@ -757,7 +766,6 @@ python scripts/check_ear_detections.py --zarr ear1_1-6m.lite.zarr --layer nuclei
 A matplotlib validation report with per-volume slice montages, per-slice Dice curves,
 threshold sweeps, the detection page and four ear pages is produced by
 `scripts/make_report.py`:
-
 ```console
 python scripts/make_report.py --artifacts /path/to/eval-output --out report.pdf --limit 6 \
     --detections detection.json \
@@ -790,6 +798,77 @@ components share one spot, which a greedy one-to-one assignment forbids.
 
 Pages are built from an explicit list, so the `n / total` footer cannot drift from the
 number of pages actually written; it did once, reporting 15 for a 16-page document.
+
+---
+
+## Validation on external annotated data (SELMA3D)
+
+The NuMorph and ear results are both in-family: NuMorph is the training distribution, and the
+ear at least shares the nuclear-counterstain target. SELMA3D is neither — expert-annotated
+human brain nuclei stained with PI, drawn as filled 3D bodies in virtual reality. It tests
+transfer, and it tests something the other two cannot: whether the label *convention* is being
+confused with accuracy.
+
+Nine patches, shipped `fold1.pt`, threshold 0.8, on a T4:
+
+| metric | value |
+|---|---|
+| semantic Dice | **0.243** |
+| semantic Dice, measured ceiling | **0.367** |
+| detection precision | **0.698** |
+| detection recall | **0.397** |
+| detection F1 (2.2 µm) | **0.493** |
+| objects, truth / predicted | 14,084 / 7,930 |
+| foreground, truth / predicted | 2.148 % / 0.585 % |
+
+The ceiling is the number that makes the rest readable. nuxnet was trained to mark a
+**single-slice disc** at each nucleus middle; SELMA3D annotates full **bodies**. A disc cannot
+overlap a body well even for a perfect detection, so `benchmark_selma3d.py --ceiling` builds
+the best possible disc prediction from the *ground-truth* centroids and scores it against the
+ground truth. That is what raw Dice must be compared to. Per-patch ceilings run 0.308–0.445,
+and Dice reaches **66 % of its ceiling** on average.
+
+Predicted foreground is **3.7× smaller** than annotated foreground — the disc-versus-body
+signature, measured. Detection, not Dice, is the headline for this data; a bit-for-bit correct
+prediction of the wrong convention still scores low Dice.
+
+Two further measurements, both of which change the result:
+
+**Spacing.** Every file header declares isotropic `1,1,1` µm; the challenge paper gives
+`0.54 × 0.54 × 5` µm for the *source* volumes. Both cannot describe the same 200³ patches. The
+same model and code score F1 **0.026** at the paper's spacing and **0.460** at the header's —
+18× apart. A sweep confirms isotropic is a genuine optimum, and inverting the annotation
+geometry (nuclei are near-spheroidal) gives an implied z of 2.33 µm, consistent with mild
+anisotropy rather than 9.3×. `scripts/selma3d_spacing.py` re-derives this per patch. A
+benchmark that skips this step reports the opposite conclusion about transfer.
+
+**Download integrity.** Three of nine raw files arrived truncated from the EBI mirror and fail
+only at decompression, halfway through a benchmark. The MHA header carries
+`CompressedDataSize`; `prepare_selma3d.py` checks it and aborts with filenames rather than
+writing a half-valid dataset.
+
+```console
+# score the shipped model
+python scripts/benchmark_selma3d.py --data nuclei2026 --model fold1.pt \
+    --spacing 1.0,1.0,1.0 --threshold 0.8 --ceiling --cuda --out benchmark.json
+
+# prepare for benchmarking and finetuning (9 raw/mask pairs -> 9 scenes + 30 tiles)
+python scripts/prepare_selma3d.py --data nuclei2026 --out data/selma3d_nuclei \
+    --spacing 2.3,1.0,1.0 --split 0.67,0.33,0.0 --to-training-grid
+```
+
+Output is 9 OME-Zarr scenes (image + expert mask, NGFF labels), a centroid table per patch
+for detection scoring, 30 non-overlapping `32×128×128` tiles at the trainer's `3.0/1.0/1.0 µm`
+grid, and a `manifest.json` recording spacing, provenance, hashes and the split warning.
+A 4-page PDF report is produced by `scripts/make_selma_report.py`.
+
+**Licence: CC BY-NC 4.0.** Evaluation and non-commercial research only; any finetune inherits
+it. Required citations are listed in the deposit's manifest.
+
+Two honest limits: the body labels are a *better* training target than discs and 30 tiles is
+enough to finetune one or two folds, but the train/val split is **by patch, not by specimen** —
+the deposit does not say which patch came from which brain, so a validation score can be
+optimistic. Both are recorded in `manifest.json` rather than left implicit.
 
 ---
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import textwrap
 from pathlib import Path
 from typing import Callable
 
@@ -47,6 +48,11 @@ AMBER = "#a86400"
 # ~173 px, which is too coarse to judge a mask boundary by eye -- the whole reason these
 # pages exist. 300 dpi puts them near 520 px.
 DPI = 300
+
+#: Characters that fit one subtitle line at 8.8 pt on an A4-width page.
+#: page_header draws the subtitle with fig.text, which does not wrap, so a
+#: too-long subtitle runs past the right margin and is clipped by the page edge.
+SUBTITLE_CHARS = 104
 
 # Mask colours: cyan / magenta / white. Maximally distinguishable from each other,
 # from greyscale anatomy, and for the most common colour-vision deficiencies.
@@ -93,7 +99,17 @@ def display_stretch(volume: np.ndarray) -> np.ndarray:
 def page_header(fig, title: str, subtitle: str = "") -> None:
     fig.text(0.06, 0.965, title, fontsize=16, fontweight="bold", color=INK, va="top")
     if subtitle:
-        fig.text(0.06, 0.933, subtitle, fontsize=8.8, color=MUTED, va="top")
+        # Wrap rather than trusting the caller. fig.text does not wrap, so a
+        # subtitle one character too long runs past the right margin and is
+        # clipped by the page edge -- invisible in the text stream, absent from
+        # the render. Explicit newlines in the argument are respected.
+        wrapped = "\n".join(
+            textwrap.fill(" ".join(line.split()), width=SUBTITLE_CHARS) if line.strip()
+            else ""
+            for line in subtitle.split("\n")
+        )
+        fig.text(0.06, 0.933, wrapped, fontsize=8.8, color=MUTED, va="top",
+                 linespacing=1.32)
     fig.add_artist(
         plt.Line2D([0.06, 0.94], [0.922, 0.922], color=RULE, linewidth=0.8)
     )
