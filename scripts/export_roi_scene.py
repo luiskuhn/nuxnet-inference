@@ -111,6 +111,41 @@ def pyramid(volume: np.ndarray, levels: int, reducer: str) -> list[np.ndarray]:
     return out
 
 
+def write_points(parent, name: str, local_voxels: np.ndarray, scale,
+                 translation, label: str, extra: dict | None = None) -> None:
+    """Write a points table, converting voxel indices to absolute microns.
+
+    Both point layers go through here so they cannot disagree about the frame. The
+    conversion is ``physical = index * scale + translation`` with ``translation`` the
+    already-absolute origin of the crop, so the region offset must NOT be added again
+    -- doing so shifts the layer in the specimen while leaving the arrays aligned,
+    which is the failure that is hardest to see by eye.
+    """
+    import zarr  # noqa: F401  (kept local to match the rest of the module)
+
+    local = np.asarray(local_voxels, dtype=np.float64)
+    physical = np.stack(
+        [local[:, i] * scale[i] + translation[i] for i in range(3)], axis=1
+    )
+    node = parent.require_group(name)
+    for i, axis in enumerate(("z", "y", "x")):
+        node.create_dataset(
+            axis, data=physical[:, i].astype(np.float32), overwrite=True,
+            dimension_separator="/",
+        )
+    for key, values in (extra or {}).items():
+        node.create_dataset(
+            key, data=np.asarray(values), overwrite=True, dimension_separator="/",
+        )
+    node.attrs["points_table"] = {
+        "axes": ["z", "y", "x"],
+        "units": "micrometer",
+        "frame": "absolute specimen coordinates",
+        "label": label,
+        "n": int(len(local)),
+    }
+
+
 def open_store(out: Path, mode: str = "a"):
     """Open the scene on a store that writes NESTED chunk keys, ``0/1/2/3``.
 
@@ -235,6 +270,9 @@ def main() -> None:
     parser.add_argument("--spots", default=None,
                         help="optional .npz of Imaris spots to add as a points table")
     parser.add_argument("--spots-key", default="Points0")
+    parser.add_argument("--centroids", default=None,
+                        help="optional .nuclei.tsv from the inference CLI, added as a "
+                             "points layer in the same frame as the image")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -348,7 +386,10 @@ def main() -> None:
                     "FF00FF", "nuclei mask", compressor, ngff_type="label",
                     window=(0.0, 1.0))
 
-    # ---- optional spots ------------------------------------------------------
+    # ---- optional point layers ----------------------------------------------
+    # Two independent detectors, so they are separate groups rather than merged:
+    # merging would hide exactly the disagreement the comparison exists to show.
+    group = open_store(out, mode="a")
     if args.spots:
         data = np.load(args.spots, allow_pickle=True)
         px = np.stack([
@@ -362,27 +403,30 @@ def main() -> None:
             & (px[:, 2] >= x_range[0]) & (px[:, 2] < x_range[1])
         )
         local = px[keep] - np.array(region)
-        # Absolute physical coordinates, so the points land in the same frame as
-        # the image. `translation` is already the absolute origin of the crop, so
-        # the region offset must NOT be added again here.
-        physical = np.stack([
-            local[:, 0] * scale[0] + translation[0],
-            local[:, 1] * scale[1] + translation[1],
-            local[:, 2] * scale[2] + translation[2],
-        ], axis=1)
-        group = open_store(out, mode="a")
-        node = group.require_group("spots")
-        node.create_dataset("z", data=physical[:, 0].astype(np.float32), overwrite=True)
-        node.create_dataset("y", data=physical[:, 1].astype(np.float32), overwrite=True)
-        node.create_dataset("x", data=physical[:, 2].astype(np.float32), overwrite=True)
-        node.attrs["points_table"] = {
-            "axes": ["z", "y", "x"],
-            "units": "micrometer",
-            "frame": "absolute specimen coordinates",
-            "label": "Imaris nuclei spots",
-            "n": int(len(local)),
-        }
-        print(f"spots             {len(local):,} points written (absolute µm)")
+        write_points(group, "spots", local, scale, translation,
+                     label="Imaris nuclei spots")
+        print(f"spots             {len(local):,} points written (absolute um)")
+
+    if args.centroids:
+        # The CLI's own instance centroids, in ROI-local voxel coordinates. Same
+        # grid and same frame as the image, because the CLI returns the mask on the
+        # input grid and localises on that mask -- so no resampling is applied here.
+        table = np.genfromtxt(args.centroids, delimiter="\t", names=True,
+                              dtype=None, encoding="utf-8")
+        local = np.stack([table["z"], table["y"], table["x"]], axis=1).astype(np.float64)
+        # A centroid is a mean of voxel indices, so it can fall a hair outside the
+        # crop when a nucleus touches the boundary; keep only points inside.
+        keep = (
+            (local[:, 0] >= 0) & (local[:, 0] < shape[0])
+            & (local[:, 1] >= 0) & (local[:, 1] < shape[1])
+            & (local[:, 2] >= 0) & (local[:, 2] < shape[2])
+        )
+        inside = local[keep]
+        write_points(group, "centroids", inside, scale, translation,
+                     label="model nuclei centroids",
+                     extra={"size_voxels": table["size_voxels"][keep]})
+        print(f"centroids         {len(inside):,} of {len(local):,} points written "
+              f"({len(local) - len(inside):,} outside the crop)")
 
     # Root-level annotations only. The multiscales entry now belongs to the root
     # itself (written above), so anything added here must not add or replace it.
@@ -391,10 +435,15 @@ def main() -> None:
         "source": str(args.zarr),
         "channel": args.channel,
     }
+    layers = ["image", "nuclei"]
+    if args.spots:
+        layers.append("spots")
+    if args.centroids:
+        layers.append("centroids")
     group.attrs["scene"] = {
         "name": "ear1_1-6m ROI",
         "description": "image and nuclei mask in absolute specimen coordinates",
-        "layers": ["image", "nuclei"] + (["spots"] if args.spots else []),
+        "layers": layers,
     }
 
     print()

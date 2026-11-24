@@ -138,3 +138,57 @@ def test_verify_scene_rejects_a_blank_store(tmp_path):
     # check is the only thing standing between this and a "successful" export.
     with pytest.raises(SystemExit, match="all zeros"):
         verify_scene(out, expected_mask_foreground=None)
+
+
+def test_roundtrip_returns_to_the_source_grid():
+    """The grid contract: resample to the training grid, predict, come back.
+
+    The mask and every centroid it yields must be in the *source* voxel frame, so a
+    chunk's result can be pasted into a store authored at the base LSFM resolution
+    without a second resampling step. If this drifts, positions silently land at the
+    training sampling and the layer no longer overlays the image.
+    """
+    torch = pytest.importorskip("torch")
+
+    from nuxnet_inference_package.preprocessing import apply_training_pipeline
+    from nuxnet_inference_package.cli_pred import extract_nuclei_instances
+
+    source_um = np.array([5.005, 3.5455, 3.5455])   # the ear ROI
+    target_um = np.array([3.0, 1.0, 1.0])           # the training grid
+
+    shape = (40, 120, 120)
+    volume = np.zeros(shape, np.float32)
+    truth = [(10, 30, 30), (25, 80, 50), (33, 60, 95)]
+    for z, y, x in truth:
+        volume[z - 1:z + 2, y - 2:y + 3, x - 2:x + 3] = 1000.0
+
+    working, details = apply_training_pipeline(
+        volume, source_voxel_size_um=source_um, target_voxel_size_um=target_um,
+        normalize=True,
+    )
+    assert details["resampled"] is True
+
+    # Upsampling must follow the spacing ratio, not some fixed factor.
+    expected = np.round(np.array(shape) * source_um / target_um).astype(int)
+    np.testing.assert_allclose(working.shape, expected, atol=1)
+
+    # Back-project exactly as cli_pred does.
+    prediction = (working > 0.5).astype(np.float32)
+    back = torch.from_numpy(prediction[None, None])
+    back = torch.nn.functional.interpolate(
+        back, size=volume.shape, mode="trilinear", align_corners=False
+    )
+    restored = (back[0, 0].numpy() >= 0.5).astype(np.uint8)
+
+    assert restored.shape == volume.shape, "mask must be returned on the input grid"
+
+    instances = extract_nuclei_instances(restored, nuclei_label=1, radius=2.0)
+    assert len(instances) == len(truth)
+
+    # And the centroids must be in source voxels, i.e. recover the planted positions.
+    for z, y, x in truth:
+        best = min(instances,
+                   key=lambda i: (i["z"] - z) ** 2 + (i["y"] - y) ** 2 + (i["x"] - x) ** 2)
+        distance = np.sqrt((best["z"] - z) ** 2 + (best["y"] - y) ** 2
+                           + (best["x"] - x) ** 2)
+        assert distance < 1.0, f"centroid {best} drifted from truth {(z, y, x)}"

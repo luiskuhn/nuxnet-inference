@@ -386,6 +386,36 @@ python scripts/export_roi_scene.py \
 napari --plugin napari-ome-zarr ear1_1-6m_roi.zarr
 ```
 
+### The scene's base frame is the original light-sheet resolution
+
+Level 0 of the scene is the marker channel as acquired: **5.005 / 3.5455 / 3.5455 µm**,
+matching `PhysicalSizeZ/Y/X` in the acquisition's OME XML to four decimal places. The lower
+levels are 2× and 4× downsampled views of that, max-pooled for the mask so nuclei do not fade
+when you zoom out. Nothing in the scene is authored on the training grid.
+
+That holds because the grid round-trips are explicit at both ends:
+
+| stage | grid | sets the frame |
+|---|---|---|
+| CLI reads the volume + its `PhysicalSize` | source | — |
+| `apply_training_pipeline` resamples | **training** (3.0/1.0/1.0) | delegates to the trainer's own `resample_volume_pair` |
+| sliding-window forward pass | training | — |
+| threshold | training | checkpoint is calibrated here |
+| trilinear back-projection, re-threshold at 0.5 | **source** | `torch.nn.functional.interpolate(size=volume.shape)` |
+| `extract_nuclei_instances` | source | runs on the back-projected mask |
+| chunker writes the mask | source | `scale_zyx` / `translation_zyx` from **source** spacing |
+
+So the mask and every centroid are in original-resolution voxels and can be pasted straight
+into a store authored at 5.005/3.5455/3.5455 µm with no second resampling. Verified on a
+synthetic volume with three planted nuclei: the input expands `40×120×120 → 67×425×425`
+(the spacing ratio, not a fixed factor), the mask comes back at `40×120×120`, and all three
+centroids are recovered at **0.00 voxel** error. `tests/test_scene_export.py` pins it.
+
+One caveat worth stating: the threshold is applied on the training grid and the binary mask is
+then interpolated. Nearest-neighbour back-projection would duplicate one Z slice in six and
+score a *perfect* mask at Dice 0.50 against itself; trilinear-then-rethreshold measures
+0.739/0.800 on two validation volumes against a 0.788/0.983 ceiling, instead of 0.454/0.390.
+
 ### Chunk keys must be nested, and getting it wrong is silent
 
 OME-NGFF 0.2 moved chunk keys from flat (`0.0.0`) to nested (`0/0/0`), and `ome_zarr` —
