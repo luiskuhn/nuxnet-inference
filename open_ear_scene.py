@@ -1,18 +1,28 @@
-"""Open the ear ROI in napari with the image, the mask and both point sets.
+"""Open the ear ROI in napari: marker, predicted mask, and both point sets.
 
     python open_ear_scene.py
 
-Four layers: the marker channel, the predicted mask, the Imaris spots and the
-model's own instance centroids. The OME-Zarr plugin loads the first two with their
-physical transform attached, but a points table is not an image, so the points are
-added explicitly.
+Eight layers: the five acquired channels, the predicted mask, the Imaris spots and
+the model's own instance centroids. Only the marker channel is visible on open --
+that is the channel the model ran on, marked ``[MODEL INPUT]`` in its name -- because
+five channels added together read as a bright smear. The other four are one click
+away in the layer list.
 
-All four share one world frame. The arrays carry ``index * scale + translate``; the
-points are stored in ABSOLUTE microns already, so they go in with scale (1, 1, 1)
-and no translation. Giving them the image's scale as well would multiply their
-coordinates a second time and scatter them off the tissue. If a point layer does
-appear displaced, the transform is wrong; keeping the correction out of the file is
-what makes that visible instead of hidden.
+Two details this file has to get right, both of which were wrong once and looked
+like a broken store rather than a broken viewer:
+
+* The reader hands back ``contrast_limits`` and ``colormap`` from the store's `omero`
+  block. They must be passed through. Rebuilding a layer with only name/scale/
+  translate makes napari fall back to a min/max stretch, and since the marker spans
+  0..22815 while only the lower end is real signal, the whole volume clips to white.
+* A multi-channel image arrives as one ``(c, z, y, x)`` array with a *list* of names,
+  so it needs ``channel_axis`` to split into one layer per channel. Without it,
+  ``add_image`` raises TypeError on the list-valued name.
+
+All layers share one world frame. The arrays carry ``index * scale + translate``; the
+points are stored in ABSOLUTE microns already, so they go in with scale (1, 1, 1) and
+no translation. Giving them the image's scale as well would multiply their coordinates
+a second time and scatter them off the tissue.
 """
 from pathlib import Path
 
@@ -37,14 +47,43 @@ def build_layers(scene: Path = SCENE):
     specs = []
     for data, meta, layer_type in reader(str(scene)):
         name = meta.get("name", "")
-        kwargs = {
-            "name": name,
-            "scale": meta.get("scale"),
-            "translate": meta.get("translate"),
-        }
-        # A label layer needs a discrete colour map, not the image's greyscale.
-        if layer_type == "labels" or "mask" in name.lower():
-            specs.append(("labels", data, kwargs))
+
+        # Carry over EVERYTHING the reader parsed, not a hand-picked subset. The
+        # OME-Zarr reader reads `contrast_limits` and `colormap` out of the store's
+        # `omero` block; rebuilding the layer with only name/scale/translate throws
+        # that away and napari then falls back to a min/max stretch. That is the same
+        # saturation bug as the hardcoded 0..1 window the exporter had: the marker
+        # spans 0..22815 but only the lower end is real signal, so the whole volume
+        # clips to white.
+        kwargs = {}
+        for key in ("name", "scale", "translate", "contrast_limits", "colormap",
+                    "metadata", "opacity", "visible"):
+            if meta.get(key) is not None:
+                kwargs[key] = meta[key]
+
+        # A multi-channel image arrives as one (c, z, y, x) array with `name` a list
+        # of per-channel names. napari needs `channel_axis` to split it into one layer
+        # per channel; without it, add_image raises TypeError on the list-valued name.
+        if meta.get("channel_axis") is not None:
+            kwargs["channel_axis"] = meta["channel_axis"]
+            kwargs.setdefault("blending", "additive")
+            # Show the marker the model actually ran on; leave the others off so the
+            # first frame is the segmentation's own input rather than five channels
+            # of anatomy added together, which reads as a bright smear. They stay one
+            # click away in the layer list.
+            labels = meta.get("name") or []
+            if isinstance(labels, list) and labels:
+                kwargs["visible"] = ["MODEL INPUT" in str(x).upper() for x in labels]
+                if not any(kwargs["visible"]):
+                    kwargs["visible"][0] = True
+
+        # A label layer takes a discrete label->colour mapping, not an image colormap,
+        # so it keeps only the transform. Its `omero` window is 0..1, which is already
+        # the right stretch for a binary mask.
+        if layer_type == "labels" or "mask" in str(name).lower():
+            label_kwargs = {k: v for k, v in kwargs.items()
+                            if k in ("name", "scale", "translate", "opacity", "visible")}
+            specs.append(("labels", data, label_kwargs))
         else:
             specs.append(("image", data, kwargs))
 

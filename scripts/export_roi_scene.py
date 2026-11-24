@@ -50,13 +50,17 @@ def span(text: str) -> tuple[int, int]:
 
 
 def axis_metadata(source_scale, source_translation, region_start, level_scales,
-                  name: str = "image"):
-    """Multiscales entry for a 3-axis [z, y, x] group with absolute placement.
+                  name: str = "image", n_channels: int = 1):
+    """Multiscales entry for a [z, y, x] or [c, z, y, x] group with absolute placement.
 
     `translation` is the physical position of voxel (0, 0, 0) of this crop within
     the specimen, i.e. the volume origin plus region_start scaled by the source
     spacing. Keeping it absolute is what lets the crop be dropped into a scene
     without a manual offset, and it means image and mask agree by construction.
+
+    With more than one channel the axis list gains a leading channel axis and every
+    scale/translation gets a leading 1.0/0.0, because NGFF requires one entry per
+    axis. Getting that length wrong makes the reader reject the store.
     """
     translation = [
         float(source_translation[i] + region_start[i] * source_scale[i])
@@ -64,49 +68,66 @@ def axis_metadata(source_scale, source_translation, region_start, level_scales,
     ]
     datasets = []
     for level, scale in enumerate(level_scales):
+        if n_channels > 1:
+            entry_scale = [1.0] + [float(v) for v in scale]
+            entry_translation = [0.0] + translation
+        else:
+            entry_scale = [float(v) for v in scale]
+            entry_translation = translation
         datasets.append(
             {
                 "path": str(level),
                 "coordinateTransformations": [
-                    {"type": "scale", "scale": [float(v) for v in scale]},
-                    {"type": "translation", "translation": translation},
+                    {"type": "scale", "scale": entry_scale},
+                    {"type": "translation", "translation": entry_translation},
                 ],
             }
         )
+    axes = [{"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"}]
+    if n_channels > 1:
+        axes.insert(0, {"name": "c", "type": "channel"})
     return {
         "version": "0.4",
         "name": name,
-        "axes": [
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
-        ],
+        "axes": axes,
         "datasets": datasets,
         "type": "gaussian",
     }
 
 
 def pyramid(volume: np.ndarray, levels: int, reducer: str) -> list[np.ndarray]:
-    """Downsample by max-pooling 2x per level on the last three axes.
+    """Downsample by 2x per level on the spatial axes, keeping any channel axis.
 
     Max, not mean, for the mask: averaging a sparse binary layer drives nuclei below
     any threshold and they vanish when zoomed out, which reads as missing detections.
     For the image, mean is the honest thumbnail.
+
+    A 4-axis input is treated as (c, z, y, x) and pooled only over z, y, x, so the
+    channel count is preserved and a multi-channel store keeps one layer per channel
+    at every level.
     """
     out = [volume]
     current = volume
     for _ in range(levels - 1):
-        if current.shape[0] < 2 or current.shape[1] < 2 or current.shape[2] < 2:
+        spatial = current.shape[-3:]
+        if min(spatial) < 2:
             break
+        # Work on a trailing (z, y, x) view so 3-axis and 4-axis inputs share the code.
+        leading = current.shape[:-3]
+        z, y, x = spatial
+        trimmed = current[..., : z - z % 2, : y - y % 2, : x - x % 2]
+        shape = leading + (z // 2, 2, y // 2, 2, x // 2, 2)
+        blocks = trimmed.reshape(shape)
+        # Reduce the size-2 axes only, i.e. the odd positions after any leading
+        # (channel) axes. Starting at len(leading) would include the first halved
+        # spatial axis and collapse the whole volume to (2, 2, 2) per level.
+        axes = tuple(range(len(leading) + 1, len(shape), 2))
         if reducer == "max":
-            z, y, x = current.shape[:3]
-            trimmed = current[: z - z % 2, : y - y % 2, : x - x % 2]
-            current = trimmed.reshape(z // 2, 2, y // 2, 2, x // 2, 2).max(axis=(1, 3, 5))
+            current = blocks.max(axis=axes)
         else:
-            z, y, x = current.shape[:3]
-            trimmed = current[: z - z % 2, : y - y % 2, : x - x % 2]
-            current = trimmed.reshape(z // 2, 2, y // 2, 2, x // 2, 2).mean(axis=(1, 3, 5))
-            current = current.astype(volume.dtype)
+            current = blocks.mean(axis=axes).astype(volume.dtype)
         out.append(current)
     return out
 
@@ -144,6 +165,56 @@ def write_points(parent, name: str, local_voxels: np.ndarray, scale,
         "label": label,
         "n": int(len(local)),
     }
+
+
+def channel_metadata(store: Path, series, n_channels: int) -> list[dict]:
+    """Channel names and colours, preferring the store's `omero`, then the OME XML.
+
+    Both sources are optional in practice: a bioformats2raw conversion may or may not
+    write `omero` on the series group, while the original acquisition always records
+    channel names in ``OME/METADATA.ome.xml``. Falling back to the XML is what keeps
+    the layer names meaningful ("Nuclei", "Veins") instead of "channel 0", which would
+    defeat the point of naming which channel the model saw.
+
+    The XML also carries the channel colour, as a packed RGBA int (signed 32-bit in
+    practice, so 100598527 and -15990785 both appear). Decoding it yields exactly the
+    same values the `omero` block would have held -- 05FF02, FF0605, ... -- so the
+    fallback keeps the acquisition's colouring instead of inventing a palette.
+    Channels are returned in axis order, which is what `--channels` indexes.
+    """
+    import xml.etree.ElementTree as ET
+
+    omero = series.attrs.get("omero", {}).get("channels", [])
+    if omero:
+        return [dict(c) for c in omero]
+
+    base = Path(str(store).rstrip("/"))
+    for candidate in (base / "OME" / "METADATA.ome.xml", base / "METADATA.ome.xml"):
+        if not candidate.exists():
+            continue
+        try:
+            root = ET.fromstring(candidate.read_text(errors="ignore"))
+        except ET.ParseError:
+            break
+        # Tolerate the namespace variants bioformats2raw emits.
+        found = []
+        for element in root.iter():
+            if element.tag.split("}")[-1] != "Channel":
+                continue
+            entry = {"label": (element.get("Name") or element.get("ID") or "").strip()}
+            packed = element.get("Color")
+            if packed:
+                try:
+                    # Packed as RGBA in a signed 32-bit int; mask to unsigned and
+                    # drop the alpha byte.
+                    entry["color"] = f"{(int(packed) & 0xFFFFFFFF) >> 8 & 0xFFFFFF:06X}"
+                except ValueError:
+                    pass
+            found.append(entry)
+        if found:
+            return found
+        break
+    return [{} for _ in range(n_channels)]
 
 
 def open_store(out: Path, mode: str = "a"):
@@ -214,9 +285,12 @@ def verify_scene(out: Path, expected_mask_foreground: int | None) -> None:
 
 
 def write_group(parent, name: str | None, levels: list[np.ndarray],
-                scale, translation, level_scales, colour: str, label: str,
+                scale, translation, level_scales, colour, label: str,
                 compressor, ngff_type: str = "gaussian",
-                window: tuple[float, float] | None = None) -> None:
+                window: tuple[float, float] | None = None,
+                channel_labels: list[str] | None = None,
+                channel_colours: list[str] | None = None,
+                channel_windows: list[tuple[float, float]] | None = None) -> None:
     """Write one multiscale image into `parent`, optionally under a child group.
 
     `name=None` writes the arrays directly into `parent`, which is what an OME-NGFF
@@ -225,13 +299,20 @@ def write_group(parent, name: str | None, levels: list[np.ndarray],
     child groups with the arrays inside them is not an image to a reader, and
     napari-ome-zarr returns zero layers for it.
 
+    For a multi-channel image the caller passes per-channel `channel_labels`,
+    `channel_colours` and `channel_windows`, and the `omero` block must list one
+    entry per channel or the reader names the layers wrongly. For a binary label
+    image the single `colour`/`label`/`window` arguments are used instead.
+
     `window` is the display range a viewer applies on open. It must come from the
     data, not from a constant: this channel spans 0..22815, and a hardcoded 0..1
     window clips every value above 1 to pure white, so the image opens as a
-    saturated black-and-white blob rather than a intensity image.
+    saturated black-and-white blob rather than an intensity image.
     """
     node = parent if name is None else parent.require_group(name)
-    node.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+    n_channels = levels[0].shape[0] if levels[0].ndim == 4 else 1
+    dims = ["c", "z", "y", "x"] if n_channels > 1 else ["z", "y", "x"]
+    node.attrs["_ARRAY_DIMENSIONS"] = dims
 
     for level, data in enumerate(levels):
         chunk = tuple(min(int(c), 64) for c in data.shape)
@@ -241,20 +322,38 @@ def write_group(parent, name: str | None, levels: list[np.ndarray],
             str(level), data=data, chunks=chunk, compressor=compressor,
             overwrite=True, fill_value=0, dimension_separator="/",
         )
-        array.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+        array.attrs["_ARRAY_DIMENSIONS"] = dims
 
     # Build the entry as a plain dict first. Mutating a value already stored in
     # node.attrs does not persist, because zarr serialises on assignment: doing
     # node.attrs["multiscales"][0]["name"] = label silently loses the label.
-    entry = axis_metadata(scale, translation, (0, 0, 0), level_scales, name=label)
+    entry = axis_metadata(scale, translation, (0, 0, 0), level_scales, name=label,
+                          n_channels=n_channels)
     entry["type"] = ngff_type
     node.attrs["multiscales"] = [entry]
-    start, end = window if window is not None else (0.0, 1.0)
-    node.attrs["omero"] = {
-        "channels": [{"color": colour, "label": label,
-                      "window": {"start": float(start), "end": float(end),
-                                 "min": float(start), "max": float(end)}}]
-    }
+
+    if channel_labels is not None:
+        colours = channel_colours or ["FFFFFF"] * len(channel_labels)
+        windows = channel_windows or [(0.0, 1.0)] * len(channel_labels)
+        channels = []
+        for i, (chan_label, chan_colour, chan_window) in enumerate(
+                zip(channel_labels, colours, windows)):
+            start, end = chan_window
+            channels.append({
+                "color": chan_colour.lstrip("#"),
+                "label": chan_label,
+                "active": True,
+                "window": {"start": float(start), "end": float(end),
+                           "min": float(start), "max": float(end)},
+            })
+        node.attrs["omero"] = {"channels": channels}
+    else:
+        start, end = window if window is not None else (0.0, 1.0)
+        node.attrs["omero"] = {
+            "channels": [{"color": colour.lstrip("#"), "label": label,
+                          "window": {"start": float(start), "end": float(end),
+                                     "min": float(start), "max": float(end)}}]
+        }
 
 
 def main() -> None:
@@ -262,7 +361,12 @@ def main() -> None:
     parser.add_argument("--zarr", required=True, help="source OME-Zarr store")
     parser.add_argument("--layer", default=None, help="mask group inside the store")
     parser.add_argument("--out", required=True, help="destination .zarr scene")
-    parser.add_argument("--channel", type=int, default=0)
+    parser.add_argument("--channel", type=int, default=0,
+                        help="the channel the model was run on; marked as such in the "
+                             "layer name")
+    parser.add_argument("--channels", default=None,
+                        help="comma-separated channels to include, default just "
+                             "--channel (for example '0,1,2,3,4')")
     parser.add_argument("--z-range", required=True)
     parser.add_argument("--y-range", required=True)
     parser.add_argument("--x-range", required=True)
@@ -327,15 +431,26 @@ def main() -> None:
           f"X {x_range[0]}:{x_range[1]}  = {shape}")
 
     # ---- image ---------------------------------------------------------------
+    # Read every requested channel as one (c, z, y, x) stack, so the store holds a
+    # single multiscale image with a channel axis rather than unrelated images.
+    # napari-ome-zarr turns that into one layer per channel, named and coloured from
+    # the `omero` block, which is what makes "which channel was the model input"
+    # answerable in the layer list rather than in the README.
+    channels = [int(c) for c in args.channels.split(",")] if args.channels else [args.channel]
     image = np.asarray(
-        series["0"][0, args.channel,
+        series["0"][0, channels,
                      z_range[0]:z_range[1], y_range[0]:y_range[1],
                      x_range[0]:x_range[1]]
     )
     print(f"image             {image.shape}  {image.dtype}  "
-          f"range {image.min()}..{image.max()}")
-    if image.shape != shape:
-        raise SystemExit(f"image crop {image.shape} != requested {shape}")
+          f"range {image.min()}..{image.max()}  channels {channels}")
+    if image.shape[1:] != shape:
+        raise SystemExit(f"image crop {image.shape[1:]} != requested {shape}")
+
+    # Input channel, by identity, not by position: the model was trained on one
+    # marker and after this it is one of several layers.
+    input_index = channels.index(args.channel)
+    print(f"model input       channel {args.channel} = index {input_index} in this stack")
 
     # ---- mask ----------------------------------------------------------------
     if args.layer:
@@ -361,17 +476,37 @@ def main() -> None:
     level_scales = [[s * (2 ** level) for s in scale]
                     for level in range(len(image_levels))]
 
-    # Display window from the data. A hardcoded 0..1 clips this channel (0..22815)
-    # to pure white on open. The 99.5th percentile as the top is the same stretch
-    # open_layers.py uses for the normalised display: a few hot voxels would
-    # otherwise push every nucleus into the dark end.
-    image_window = (float(np.percentile(image, 1.0)),
-                    float(np.percentile(image, 99.5)))
-    print(f"image window      {image_window[0]:.0f}..{image_window[1]:.0f} "
-          f"(1st..99.5th percentile)")
+    # Per-channel display: name, colour and window all come from the source's own
+    # `omero` block where it has one, so the scene shows the channels the way the
+    # acquisition did. The channel the model actually saw is renamed to say so -- the
+    # point of carrying the other channels is to judge the segmentation against the
+    # anatomy, and that requires knowing which layer produced it.
+    source_channels = channel_metadata(Path(args.zarr), series, len(channels))
+    channel_labels, channel_colours, channel_windows = [], [], []
+    for position, channel_index in enumerate(channels):
+        meta = source_channels[channel_index] if channel_index < len(source_channels) else {}
+        name = meta.get("label") or f"channel {channel_index}"
+        if channel_index == args.channel:
+            name = f"{name} [MODEL INPUT]"
+        plane = image[position]
+        # Window from the data, never a constant: a hardcoded 0..1 clips this
+        # channel (0..22815) to pure white. The 99.5th percentile top matches the
+        # stretch open_layers.py uses, so a few hot voxels cannot push every nucleus
+        # into the dark end.
+        window = (float(np.percentile(plane, 1.0)), float(np.percentile(plane, 99.5)))
+        colour = str(meta.get("color", "FFFFFF"))
+        channel_labels.append(name)
+        channel_colours.append(colour)
+        channel_windows.append(window)
+        marker = " <- model input" if channel_index == args.channel else ""
+        print(f"  channel {channel_index}: {name:34s} {colour}  "
+              f"window {window[0]:.0f}..{window[1]:.0f}{marker}")
+
     write_group(group, None, image_levels, scale, translation, level_scales,
-                "FFFFFF", "nuclei (SYTOX)", image_compressor,
-                window=image_window)
+                "FFFFFF", channel_labels[0], image_compressor,
+                channel_labels=channel_labels,
+                channel_colours=channel_colours,
+                channel_windows=channel_windows)
 
     # ---- mask as a label image ----------------------------------------------
     # Nested under labels/, not beside the image. That is the OME-NGFF place for a

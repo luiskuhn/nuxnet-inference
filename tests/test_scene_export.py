@@ -192,3 +192,90 @@ def test_roundtrip_returns_to_the_source_grid():
         distance = np.sqrt((best["z"] - z) ** 2 + (best["y"] - y) ** 2
                            + (best["x"] - x) ** 2)
         assert distance < 1.0, f"centroid {best} drifted from truth {(z, y, x)}"
+
+
+def test_pyramid_halves_only_the_spatial_axes():
+    """Every level must halve z, y, x and nothing else.
+
+    A channel axis makes the reshape ``(c, z/2, 2, y/2, 2, x/2, 2)``, and reducing
+    the wrong axis positions collapses the whole volume to (2, 2, 2) per level while
+    still producing a decreasing sequence -- so a shape-only check on level 0 passes
+    and the store looks fine until a reader rejects it. Asserting every level keeps the
+    channel count and the expected spatial shape is what catches that.
+    """
+    from scripts.export_roi_scene import pyramid
+
+    # 3 axes: mask, max-pooled so a single voxel survives every level.
+    mask = np.zeros((8, 16, 16), np.uint8)
+    mask[3, 5, 7] = 1
+    levels = pyramid(mask, 3, "max")
+    assert [lv.shape for lv in levels] == [(8, 16, 16), (4, 8, 8), (2, 4, 4)]
+    assert all(lv.max() == 1 for lv in levels), "max-pooling must not lose the voxel"
+
+    # 4 axes: channels are carried through untouched.
+    stack = np.zeros((5, 216, 690, 630), np.uint16)
+    stack[:, 10:20, 10:20, 10:20] = 7
+    levels = pyramid(stack, 3, "mean")
+    assert [lv.shape for lv in levels] == [
+        (5, 216, 690, 630), (5, 108, 345, 315), (5, 54, 172, 157)
+    ]
+    assert all(lv.shape[0] == 5 for lv in levels), "channel count must be preserved"
+    assert all(lv.max() == 7 for lv in levels), "signal must survive downsampling"
+
+
+def test_viewer_helpers_keep_the_stored_contrast_window(tmp_path):
+    """A viewer must not recompute the display window the store already carries.
+
+    Both helpers rebuilt each layer from only name/scale/translate, discarding the
+    ``contrast_limits`` the OME-Zarr reader parses out of `omero`. napari then fell
+    back to a min/max stretch and the marker -- which spans 0..22815 with signal only
+    at the bottom -- opened as a white blob. Shape and transform checks all passed, so
+    only asserting on the *window* catches it.
+    """
+    pytest.importorskip("napari")
+    import pathlib
+
+    import numpy as np
+
+    from scripts.export_roi_scene import open_store, write_group
+    from numcodecs import Blosc
+
+    store = tmp_path / "scene.zarr"
+    group = open_store(store, mode="w")
+    data = np.zeros((2, 8, 16, 16), np.uint16)
+    data[0, 2:5, 4:8, 4:8] = 20000      # bright: min/max would clip everything below
+    data[1, 2:5, 8:12, 8:12] = 900
+    write_group(
+        group, None, [data], (5.0, 3.5, 3.5), (0.0, 0.0, 0.0),
+        [(5.0, 3.5, 3.5)], "FFFFFF", "nuclei",
+        compressor=Blosc(cname="zstd", clevel=5, shuffle=0),
+        channel_labels=["Nuclei [MODEL INPUT]", "Veins"],
+        channel_colours=["05FF02", "FF0605"],
+        channel_windows=[(0.0, 400.0), (0.0, 900.0)],
+    )
+
+    # The reader must surface the window ...
+    from napari_ome_zarr import napari_get_reader
+
+    entries = napari_get_reader(str(store))(str(store))
+    data_out, meta, kind = entries[0]
+    assert meta.get("contrast_limits") == [[0, 400], [0, 900]]
+    assert meta.get("channel_axis") == 0
+    assert meta.get("name") == ["Nuclei [MODEL INPUT]", "Veins"]
+
+    # ... and the helpers must pass it on rather than substituting their own.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "scene_helper", pathlib.Path(__file__).parent.parent / "open_ear_scene.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    specs = helper.build_layers(store)
+    images = [kw for kind_, _, kw in specs if kind_ == "image"]
+    assert len(images) == 1
+    assert images[0]["contrast_limits"] == [[0, 400], [0, 900]], (
+        "helper must forward the stored window, not recompute it"
+    )
+    assert images[0]["channel_axis"] == 0
+    # Only the marked channel starts visible.
+    assert images[0]["visible"] == [True, False]
