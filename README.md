@@ -680,12 +680,21 @@ and are skipped when their arguments are omitted.
 The four ear pages are: two of slices (four each, chosen by how many nuclei fall on them
 rather than by depth fraction, because evenly spaced slices land on empty planes), one of a
 max projection plus the same patch at three magnifications, and one overlaying the model
-mask with the Imaris spots. The slice pages run at 1092×1196 px per panel — a 690×630 slice
-is nearly square, so on portrait paper the only way to make panels larger is to put fewer
-of them on a page. The agreement page matches nuclei in 3D at 7.4 µm, the same rule as the
-pooled numbers, and reproduces precision 0.376 / recall 0.664 per plane. Matching per plane
-instead reads 0.17, because the two detectors place a nucleus's single-slice disc up to
-1.5 Z voxels apart.
+mask with the Imaris spots.
+
+The slice panels grew from 0.235×0.150 of the page to 0.440 of the page width at the data's
+own aspect, which is **2.3× wider and 5.2× the displayed area** per slice. The larger gain
+is not from fewer panels alone: the old 0.235×0.150 box had an aspect of 1.11 against the
+data's 0.91, so `imshow` letterboxed every slice and 18% of each box was blank. Sizing the
+axes from the data shape removes that. Panels are now 1092×1196 px at 300 dpi.
+
+The agreement page matches nuclei in 3D at 7.4 µm, the same rule as the pooled numbers, and
+reproduces precision 0.376 / recall 0.664 per plane. Matching per plane instead reads 0.17,
+because the two detectors place a nucleus's single-slice disc up to 1.5 Z voxels apart; a
+shared nucleus is then two misses on its own plane. The match itself is imported from
+`compare_ear_spots.py` rather than re-derived, because a hand-rolled nearest-neighbour
+version counted 26,728 matches against the real 26,264 — nearest-neighbour lets two
+components share one spot, which a greedy one-to-one assignment forbids.
 
 Pages are built from an explicit list, so the `n / total` footer cannot drift from the
 number of pages actually written; it did once, reporting 15 for a 16-page document.
