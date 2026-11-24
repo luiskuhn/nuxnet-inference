@@ -116,6 +116,23 @@ def dedent(text: str) -> str:
     return textwrap.dedent(text).strip("\n")
 
 
+def _flow(text: str, width: int = 118) -> str:
+    """Dedent, then rewrap to a width that fits the page at 7.2 pt.
+
+    Paragraphs separated by a blank line stay separate. Without this, a block
+    hand-wrapped to ~100 columns is laid out at whatever width the author typed, which
+    is how a paragraph ended up 23 lines tall in a 2.4 in gap and its last eight lines
+    were placed below the bottom edge -- still in the PDF's text stream, invisible in
+    the render.
+    """
+    import textwrap
+
+    paragraphs = dedent(text).split("\n\n")
+    return "\n\n".join(
+        textwrap.fill(" ".join(p.split()), width=width) for p in paragraphs
+    )
+
+
 def mask_rgb(truth: np.ndarray | None, pred: np.ndarray | None) -> np.ndarray:
     """Compose a mask into RGB using the report's colour convention."""
     shape = (truth if truth is not None else pred).shape
@@ -1291,6 +1308,11 @@ def page_ear_roi(
         source voxels, 36% tissue -- chosen because it contains the macrophage and
         neutrophil spots, and because it fits in memory as a single volume, so its
         normalization matches training exactly and there are no seams to explain away.
+
+        The ROI is 0.91% of the full-ear volume: 16% of Z, 22% of Y, 26% of X, i.e.
+        1081 x 2446 x 2234 µm of a 6772 x 11211 x 8587 µm ear. Nothing below describes the
+        other 99% of the ear. At this ROI's measured rate the whole volume is 140 chunks of
+        this size, about 83 h on one T4, or ~30 h with empty-chunk skipping at 36% tissue.
         """).replace("\n        ", "\n"),
         fontsize=8.0, color=INK, va="top", linespacing=1.5,
     )
@@ -1472,21 +1494,53 @@ def _axis_height(width_frac: float, ny: int, nx: int) -> float:
     return width_frac * (PAGE_W_IN / PAGE_H_IN) * (ny / nx)
 
 
+def _scene_marker_channel(root) -> tuple[int, str]:
+    """Which channel of the scene is the channel the model was run on.
+
+    Chosen by the ``[MODEL INPUT]`` label rather than by position, because the
+    channel order belongs to the acquisition. Falls back to 0 for a single-channel
+    store, which is what the report was originally written against.
+    """
+    channels = root.attrs.get("omero", {}).get("channels", [])
+    if len(channels) <= 1:
+        return 0, "nuclei"
+    marked = [i for i, c in enumerate(channels)
+              if "MODEL INPUT" in str(c.get("label", "")).upper()]
+    if not marked:
+        return 0, str(channels[0].get("label", "nuclei"))
+    return marked[0], str(channels[marked[0]].get("label", "nuclei"))
+
+
 def _ear_scene_data(scene):
     """Load ROI image, mask and Imaris spots in one physical frame.
 
     Spots are converted from absolute microns back to voxel indices using the
     layer's own transform, so a wrong transform shows up as spots displaced from
     the tissue instead of silently agreeing with it.
+
+    The scene can be either single-channel ``(z, y, x)`` or multi-channel
+    ``(c, z, y, x)``, and the transform carries a leading axis for every spatial
+    axis plus time. Both are handled by taking the marker channel and the last
+    three transform entries, so the report reads a 5-channel scene and a
+    one-channel scene the same way.
     """
     import zarr
 
     root = zarr.open_group(str(scene), mode="r")
-    image = np.asarray(root["0"][:]).astype(np.float32)
+    volume = np.asarray(root["0"][:])
+    channel, channel_label = _scene_marker_channel(root)
+    if volume.ndim == 4:
+        # (c, z, y, x). Pick the marker plane rather than summing channels: the
+        # report's contrasts and "intensity under the mask" figures describe one
+        # marker, and averaging five anatomical channels would describe none.
+        volume = volume[channel]
+    image = volume.astype(np.float32)
     mask = np.asarray(root["labels"]["nuclei"]["0"][:]) > 0
     entry = root.attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"]
-    scale = np.array(entry[0]["scale"], dtype=float)
-    translate = np.array(entry[1]["translation"], dtype=float)
+    # The transform describes every axis of the stored array, so a 4D (c,z,y,x)
+    # store has four entries. Only the spatial three matter here.
+    scale = np.array(entry[0]["scale"], dtype=float)[-3:]
+    translate = np.array(entry[1]["translation"], dtype=float)[-3:]
 
     spots = None
     if "spots" in root:
@@ -1827,7 +1881,7 @@ def page_ear_agreement(pdf: PdfPages, page: int, total: int, scene: Path | None)
     spot_matched = cKDTree(centroids * voxel_um).query(spots * voxel_um, k=1)[0] <= 7.4
     comp_centroid_z = np.rint(centroids[:, 0]).astype(int)
 
-    width = 0.432
+    width = 0.360
     height = _axis_height(width, ny, nx)
     top = 0.845
     gap = 0.022
@@ -1929,20 +1983,29 @@ def page_ear_agreement(pdf: PdfPages, page: int, total: int, scene: Path | None)
 
     fig.text(
         0.062, top - 2 * height - gap - 0.026,
-        dedent("""
+        _flow("""
         Read the page as a picture of a disagreement, not of an error. Where white appears, both
         methods placed a detection on the same nucleus, and their centroids agree to a median of
         4.11 um -- under one XY voxel. The magenta-only markers are nuclei the model reports and
-        Imaris does not; the intensity test on the previous page shows those sit on SYTOX-bright
-        objects indistinguishable from the matched ones (0.97x the intensity, 1.02 detections per
-        nucleus). The cyan-only markers are the converse. Those figures are on the ROI page.
+        Imaris does not; the intensity test shows those sit on SYTOX-bright objects
+        indistinguishable from the matched ones (0.97x the intensity, 1.02 detections per
+        nucleus). The cyan-only markers are the converse.
 
         Counts are nuclei, matched in 3D at 7.4 um -- half a measured nucleus, the same rule as the
         pooled figures. Matching per plane would understate agreement badly, because the two
         detectors place a nucleus's single-slice disc up to 1.5 Z voxels apart and a shared nucleus
         would then count as two misses. The side panels show which of those 3D-matched nuclei have
         their centre on the displayed slice. Light rings are a print aid only.
-        """).replace("\n        ", "\n"),
+
+        Why the two point sets can look unrelated in a viewer: 64,959 centroids and 39,510 spots in
+        690 x 630 x 216 voxels is dense, and a centroid's nearest neighbour is another centroid, a
+        median 16.7 um away -- farther than the 12.0 um to its nearest Imaris spot. The point that
+        looks closest on screen is therefore usually the wrong point. The sets are related: 45% of
+        centroids have a spot within 10 um against 2.8% for random points, a median 7.3x closer than
+        chance. Shifting the whole centroid cloud by its best global offset improves that median by
+        only 1.9%, so this is agreement with residual scatter, not a misregistration. Query the
+        sets; do not judge them by eye.
+        """),
         fontsize=7.2, color=INK, va="top", linespacing=1.45,
     )
 

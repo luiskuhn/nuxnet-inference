@@ -681,6 +681,13 @@ Region: 216 × 690 × 630 source voxels at 5.005 / 3.5455 / 3.5454 µm, 36% tiss
 as one volume in 28.4 min on a T4. Output 64,959 nuclei over 285,352 foreground voxels —
 4.4 voxels each, matching the 5-voxel plus-disc target.
 
+That region is **0.91% of the ear**: 16% of Z, 22% of Y, 26% of X, or 1081 × 2446 × 2234 µm
+of a 6772 × 11211 × 8587 µm volume. Every figure below describes that ROI and not the other
+99%. Scaling the ROI's own measured rate, the full ear is 140 chunks of this size — about
+83 h on one T4, or ~30 h with empty-chunk skipping at 36% tissue. The chunker is designed
+for that run (resumable, one z-slab at a time, `--skip-empty`), but it has not been done, and
+no full-ear mask exists in this repository or the store it was written into.
+
 Imaris "Spots - Nuclei" reports 39,510 spots in the same region. Comparing against it:
 
 | metric | value |
@@ -712,6 +719,33 @@ The model and Imaris disagree about *which nuclei exist*, not about *where a giv
 is*: where they agree, the median matched distance is 4.11 µm, under one XY voxel and well
 inside a nucleus. Reporting 0.376 as precision would understate the tool; omitting the
 comparison would hide a genuine disagreement. Both are reported.
+
+#### The two point sets look unrelated in a viewer, and that is a density illusion
+
+Opening both point layers at once, the model's centroids and the Imaris spots read as two
+independent clouds. They are not, but the eyes are being given a fair reason to say so:
+
+| measurement | value |
+|---|---|
+| median centroid → nearest Imaris spot | **12.0 µm** |
+| median centroid → nearest *other* centroid | **16.7 µm** |
+| median random point → nearest Imaris spot | 88.1 µm |
+| centroids with a spot within 10 µm | 45.3% |
+| random points with a spot within 10 µm | 2.8% |
+
+With 64,959 centroids in this volume, a centroid is nearer to another centroid than to the
+Imaris marker it corresponds to. So the visually "closest" point to any given centre is
+usually another model detection, and the two clouds never appear to pair up. The sets are
+strongly related — the median distance to an Imaris spot is **7.3× closer than chance**, and
+45% are within 10 µm — but the relationship is not legible by eye at this density.
+
+This is not a registration error, and that is checkable. Shifting the entire centroid cloud
+by its best global offset, searched over ±3 Z and ±6 XY voxels, improves the median by only
+**1.9%**. A coordinate or transform bug would improve dramatically under a global shift; a
+real detector disagreement would not.
+
+The practical consequence: compare these sets by query, not by looking. `compare_ear_spots.py`
+does the query and reports 26,264 one-to-one matches at 7.4 µm.
 
 ```console
 python scripts/compare_ear_spots.py --prediction ear1_1-6m.lite.zarr --layer nuclei_mask_roi \
@@ -900,15 +934,16 @@ nuxnet-pred smoke-test --help
 ## Tests
 
 ```console
-pytest tests/ -q                                  # 19 passed, 2 skipped without a training checkout
-NUXNET_TRAINING_DIR=/path/to/nuxnet-training pytest tests/ -q   # 21 passed
+pytest tests/ -q                                  # 28 passed, 2 skipped without a training checkout
+NUXNET_TRAINING_DIR=/path/to/nuxnet-training pytest tests/ -q   # adds the 2 verbatim-parity checks
 ```
 
 | file | covers |
 |---|---|
 | `test_training_parity.py` | architecture identity, verbatim check, golden keys, strict load |
-| `test_preprocessing.py` | resampling, calibration parsing, projection, normalization order (14 tests) |
+| `test_preprocessing.py` | resampling, calibration parsing, projection, normalization order |
 | `test_dataloading_parity.py` | the vendored dataloader still matches the trainer's |
+| `test_scene_export.py` | the OME-Zarr scene: nested chunks, layout, grid round-trip, finest-level view |
 
 The 2 skipped tests are the ones that need `NUXNET_TRAINING_DIR`; skipping rather than
 failing is deliberate, so a clone without the training repo is still testable.
