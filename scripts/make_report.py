@@ -37,6 +37,7 @@ from scipy import ndimage as ndi
 INK = "#141414"
 MUTED = "#5f5f5f"
 RULE = "#d8d8d8"
+RULE_LIGHT = "#c8c8d0"   # big stage numbers, readable but recessive
 BLUE = "#2251a4"
 GREEN = "#1f7a3f"
 AMBER = "#a86400"
@@ -52,6 +53,14 @@ C_TRUTH = "#00d5ff"   # ground truth only
 C_PRED = "#ff2d95"    # prediction only
 C_BOTH = "#ffffff"    # agreement
 BG = "#000000"        # mask panel background
+
+# Detection-metric colours. Deliberately the same hue family as the mask panels so a
+# reader can carry the association across pages: cyan is truth-side (recall), magenta
+# is prediction-side (precision).
+PRECISION_C = "#ff2d95"
+RECALL_C = "#00b8dd"
+F1_C = "#6b46c1"
+DIST_C = "#a86400"
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +344,10 @@ def page_method(pdf: PdfPages, page: int, total: int) -> None:
         dedent("""
         A checkpoint reproduces its training behaviour only if inference feeds it what the
         trainer fed it. The original CLI did the opposite: whole-volume inference at the
-        sampling the file happened to be stored at, no resampling, no tiling. On a NuMorph
-        volume that scored Dice 0.114 — a pipeline mismatch, not a bad model.
+        sampling the file happened to be stored at, no resampling, no tiling. Measured on
+        the bundled example, that path scores input-grid Dice 0.456 and training-grid Dice
+        0.452, against 0.739 and 0.860 with training-grid inference. That gap is the
+        pipeline, not the model.
         """).replace("\n        ", "\n"),
         fontsize=9.0,
         color=INK,
@@ -391,6 +402,260 @@ def page_method(pdf: PdfPages, page: int, total: int) -> None:
 
     page_footer(fig, page, total,
                 "post-processing (extract_nuclei_instances, write_instances_tsv) is unchanged from forward-cycle")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
+def _stage_block(fig, y: float, number: str, title: str, operation: str,
+                 code: str | None, why: str) -> float:
+    """Lay out one numbered stage and return the y where the next one starts.
+
+    Splitting the layout out of the page bodies keeps the vertical arithmetic in
+    one place: previously each page recomputed it and they drifted.
+    """
+    fig.text(0.06, y, number, fontsize=13, fontweight="bold", color=RULE_LIGHT,
+             va="top", ha="left")
+    fig.text(0.105, y, title, fontsize=9.4, fontweight="bold", color=BLUE, va="top")
+    fig.text(0.105, y - 0.0195, operation, fontsize=7.6, color=INK, va="top",
+             linespacing=1.42)
+    y -= 0.0195 + 0.0122 * (operation.count("\n") + 1)
+
+    if code:
+        lines = code.count("\n") + 1
+        height = 0.0122 * lines + 0.013
+        fig.patches.append(
+            plt.Rectangle((0.103, y - height + 0.0075), 0.845, height,
+                          transform=fig.transFigure, facecolor="#f4f4f6",
+                          edgecolor="none", zorder=0)
+        )
+        fig.text(0.112, y, code, fontsize=6.5, color="#2b2b2b", family="monospace",
+                 va="top", linespacing=1.34)
+        y -= height + 0.004
+
+    fig.text(0.105, y, why, fontsize=7.0, color=AMBER, va="top", linespacing=1.38)
+    return y - 0.0122 * (why.count("\n") + 1) - 0.016
+
+
+def page_preprocessing(pdf: PdfPages, page: int, total: int) -> None:
+    """Load, calibrate, normalize, resample -- everything before the network runs.
+
+    These four steps are where inference silently diverges from training, so each
+    one gets its actual code and the measurement that pinned the choice.
+    """
+    fig = plt.figure(figsize=(8.27, 11.69))
+    page_header(
+        fig,
+        "Preprocessing: putting the volume on the training grid",
+        "The network has no concept of physical scale. These steps supply it.",
+    )
+
+    fig.text(
+        0.06, 0.893,
+        dedent("""
+        A convolution kernel is 3 voxels wide whether those voxels are 1 µm or 4 µm apart, so
+        a checkpoint only means anything at the sampling it was trained on: 3.0 / 1.0 / 1.0 µm.
+        Everything on this page exists to transform arbitrary microscopy into that grid, and
+        each operation is delegated to the trainer's own function so the two cannot drift.
+        """).replace("\n        ", "\n"),
+        fontsize=8.2, color=INK, va="top", linespacing=1.5,
+    )
+
+    y = 0.815
+    y = _stage_block(
+        fig, y, "1", "Read the pixels and the calibration",
+        "Axes are resolved by name, never by position: the OME-XML axis list is searched for\n"
+        "Z, Y and X and the array transposed into that order. Any remaining axis must be a\n"
+        "singleton and is squeezed. Values are cast to float32. For OME-NGFF the same happens\n"
+        "through the multiscales metadata, where scale and translation are read per axis.",
+        "tifffile: TiffFile -> series.asarray()\n"
+        "ome:      PhysicalSizeZ, PhysicalSizeY, PhysicalSizeX  (µm)\n"
+        "zarr:     multiscales[0].datasets[0].coordinateTransformations",
+        "The ear store is [t, c, z, y, x], so a positional scale[-3:] happens to be correct here\n"
+        "and would be silently wrong on a [c, z, y, x] store. Name lookup cannot make that mistake.",
+    )
+
+    y = _stage_block(
+        fig, y, "2", "Normalize with one range per volume",
+        "Contrast is rescaled by a single min/max for the whole volume, clipped to [0, 1].\n"
+        "The range is computed AFTER resampling, because interpolating raw intensities and then\n"
+        "interpolating normalized ones give different values at every new voxel.",
+        "low, high = volume.min(), volume.max()\n"
+        "out = clip((volume - low) / (high - low), 0, 1)",
+        "Per-chunk min/max is a correctness bug, not a tuning choice: identical tissue got\n"
+        "different contrast depending on which chunk it landed in, and tiled-vs-untiled Dice\n"
+        "fell to 0.458. A chunked run therefore passes one shared --normalization-range.",
+    )
+
+    y = _stage_block(
+        fig, y, "3", "Resample to 3.0 / 1.0 / 1.0 µm, per axis",
+        "Each axis gets its own factor, source µm divided by target µm, and its own output\n"
+        "length. A Gaussian pre-blur is applied only to axes that shrink, with sigma derived\n"
+        "from the factor, so downsampling does not alias. Upsampling is left unfiltered.",
+        "factor = source_um / target_um            # per axis, e.g. 1.67 / 3.55 / 3.55\n"
+        "out_len = round(in_len * factor)\n"
+        "if factor < 1: gaussian_blur(axis, sigma=0.5*(1/factor - 1))",
+        "One isotropic factor would be visibly wrong on this data: Z needs 1.67x and XY need\n"
+        "3.55x. On the ear ROI that is 216x690x630 becoming 360x2446x2234 voxels.",
+    )
+
+    y = _stage_block(
+        fig, y, "4", "Interpolate trilinearly, preserving physical extent",
+        "Trilinear with align_corners=False, so a destination index maps to\n"
+        "src = (dst + 0.5) * (src_len / dst_len) - 0.5. The voxel count changes; the micrometres\n"
+        "the volume spans do not. That is why the output mask can carry the input's spacing.",
+        "F.interpolate(vol, size=out_shape, mode='trilinear', align_corners=False)\n"
+        "# labels instead use mode='nearest-exact', so binary stays binary",
+        "align_corners=True shifts content by up to half a voxel and would misregister the mask\n"
+        "against the image in napari. Measured: neighbouring axes land within 1 source voxel.",
+    )
+
+    fig.text(0.06, 0.152, "What this costs, and what it saves", fontsize=9.4,
+             fontweight="bold", color=BLUE)
+    fig.text(
+        0.06, 0.136,
+        dedent("""
+        Resampling is not free: the ear sits at 5.005 / 3.5455 / 3.5454 µm, so reaching
+        3.0 / 1.0 / 1.0 µm multiplies the voxel count by 1.67 x 3.55 x 3.55 = 21x. The nucleus
+        channel alone is then ~82 GB as float32 for the whole ear, which is why the layer is
+        written region by region rather than in one pass, and why the reciprocal direction --
+        projecting the finished mask back onto the input grid -- is done by interpolating the
+        BINARY mask and re-thresholding at 0.5 rather than by interpolating probabilities.
+        """).replace("\n        ", "\n"),
+        fontsize=7.8, color=INK, va="top", linespacing=1.5,
+    )
+
+    page_footer(fig, page, total,
+                "source: nuxnet_inference_package/preprocessing.py, data_loading/data_loader.py")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
+def page_forward(pdf: PdfPages, page: int, total: int) -> None:
+    """Sliding window, the network, blending, and the path from probability to centroid."""
+    fig = plt.figure(figsize=(8.27, 11.69))
+    page_header(
+        fig,
+        "Forward pass, then mask to centroids",
+        "How a probability map becomes the .nuclei.tsv rows on the previous page.",
+    )
+
+    fig.text(
+        0.06, 0.893,
+        dedent("""
+        The network is a 3D U-Net with 2.36 M parameters: one input block, two downsampling
+        blocks, a bottleneck, two upsampling blocks with skip concatenation, and a 1x1x1 head
+        producing two logits per voxel. Shown below are the real tensor shapes for one
+        32 x 128 x 128 tile, and the operations that turn its output into positions.
+        """).replace("\n        ", "\n"),
+        fontsize=8.2, color=INK, va="top", linespacing=1.5,
+    )
+
+    # ---- tensor shape trace --------------------------------------------------
+    ax = fig.add_axes((0.075, 0.545, 0.375, 0.285))
+    ax.axis("off")
+    rows = [
+        ("input", "(1, 1, 32, 128, 128)"),
+        ("inc  ConvBlock 1->32", "(1, 32, 32, 128, 128)"),
+        ("down1  2x2/s2, 32->64", "(1, 64, 16, 64, 64)"),
+        ("down2  2x2/s2, 64->128", "(1, 128, 8, 32, 32)"),
+        ("mid  ConvBlock 128", "(1, 128, 8, 32, 32)"),
+        ("up1  x2 + cat(x2), ->64", "(1, 64, 16, 64, 64)"),
+        ("up2  x2 + cat(x1), ->32", "(1, 32, 32, 128, 128)"),
+        ("outc  1x1x1 head", "(1, 2, 32, 128, 128)"),
+    ]
+    fig.text(0.075, 0.836, "Tensor shapes for one tile", fontsize=9.0,
+             fontweight="bold", color=BLUE)
+    yy = 0.820
+    for name, shape in rows:
+        highlight = name.startswith(("input", "outc"))
+        fig.text(0.075, yy, name, fontsize=6.6,
+                 family="monospace", color=INK if highlight else MUTED,
+                 fontweight="bold" if highlight else "normal")
+        fig.text(0.435, yy, shape, fontsize=6.6, family="monospace",
+                 color=INK if highlight else MUTED, ha="right")
+        yy -= 0.0138
+
+    fig.text(0.075, 0.700,
+             "2,364,834 parameters -- constant across batch 1/2/4",
+             fontsize=6.8, color=MUTED, style="italic")
+
+    # ---- why the tiling rules exist -----------------------------------------
+    fig.text(0.500, 0.836, "Why each rule exists", fontsize=9.0,
+             fontweight="bold", color=BLUE)
+    fig.text(
+        0.500, 0.818,
+        dedent("""
+        Multiple of 4. Two stride-2 downsamplings halve each axis twice, so
+        every spatial dimension must be divisible by 4 or the upsampled
+        feature map is one voxel wider than its skip connection and
+        torch.cat raises a size mismatch. A 53-voxel axis is therefore a
+        hard error, not a mild degradation.
+
+        Two classes, not three. The head emits background and marker. Only
+        the marker logit matters: softmax(dim=1)[:, 1] is the foreground
+        probability. Using argmax would give the same binary decision but
+        throw away the confidence the threshold needs.
+
+        Logits, not probabilities. The head is a bare 1x1x1 convolution,
+        so its output is unbounded. Applying a threshold of 0.8 directly to
+        logits would mark almost the entire volume foreground.
+        """).replace("\n        ", "\n"),
+        fontsize=6.9, color=INK, va="top", linespacing=1.45,
+    )
+
+    y = 0.640
+    y = _stage_block(
+        fig, y, "5", "Slide, with overlap, then blend with a Hann taper",
+        "The volume is cut into 32 x 128 x 128 windows stepping by 50% (or 25%) of a window.\n"
+        "Overlapping predictions are combined by a separable Hann weight and divided by the\n"
+        "accumulated weight, so a voxel near one tile's edge is carried mostly by its neighbour.",
+        "step = round(patch * (1 - overlap))\n"
+        "prob += tile_prob * w ;  wsum += w\n"
+        "prob = where(wsum > 0, prob / wsum, prob)",
+        "Dividing where wsum > 0 and not by a clamped denominator matters: the separable taper\n"
+        "reaches ~5e-8 in a volume corner, so np.maximum(wsum, 1e-6) silently rescales corner\n"
+        "voxels. Measured on a constant-0.9 input: 0.90 returned as 0.04 in 104 corner voxels.",
+    )
+
+    y = _stage_block(
+        fig, y, "6", "Threshold on the training grid, then project back",
+        "prob >= 0.80 gives a binary mask at 3.0 / 1.0 / 1.0 µm. To return it to the file's own\n"
+        "grid, the BINARY mask is interpolated trilinearly and re-thresholded at 0.5, so an\n"
+        "output voxel is foreground when most contributing source voxels were.",
+        "mask = (prob >= 0.80)                      # training grid\n"
+        "back = interpolate(mask, input_shape, 'trilinear', align_corners=False)\n"
+        "mask_input = (back >= 0.5)",
+        "Interpolating probabilities and thresholding afterwards was worse, because smoothing\n"
+        "pulls peak probability below the operating point: 0.658 vs 0.800 of ceiling on\n"
+        "C121_0009. Nearest-neighbour duplicates slices and scores only 0.390.",
+    )
+
+    y = _stage_block(
+        fig, y, "7", "Label, cluster, and average -- the unchanged post-processing",
+        "extract_nuclei_instances labels the mask with 6-connectivity, builds a KD-tree\n"
+        "neighbourhood graph at radius 2 voxels, takes its connected components, and reports the\n"
+        "mean voxel coordinate of each. This is untouched code from the original CLI.",
+        "labeled = measure.label(mask, connectivity=1)\n"
+        "tree = KDTree(argwhere(labeled > 0)); edges where distance <= 2\n"
+        "centroid = mean(component_coords)   ->  write_instances_tsv(id, z, y, x, size)",
+        "This step is why the mask is not the only output. A mask says which voxels; the centroid\n"
+        "says where the nucleus is, which is what a biologist wants to load as points.",
+    )
+
+    fig.text(
+        0.06, 0.118,
+        dedent("""
+        Result of the whole path on the 32-volume NuMorph set: training-grid Dice 0.801,
+        detection F1 0.926, median matched-centroid distance 0.45 µm. The 0.45 µm figure is the
+        honest accuracy of a reported position -- it is a sixth of a voxel on the XY plane and
+        less than a tenth of a Z step, so the centroids are localised far more tightly than the
+        mask Dice would suggest.
+        """).replace("\n        ", "\n"),
+        fontsize=7.6, color=INK, va="top", linespacing=1.5,
+    )
+
+    page_footer(fig, page, total,
+                "source: model/unet_3d_models.py, preprocessing.py, cli_pred.py:extract_nuclei_instances")
     pdf.savefig(fig, dpi=DPI)
     plt.close(fig)
 
@@ -776,6 +1041,555 @@ def page_table(pdf: PdfPages, results: list[dict], page: int, total: int) -> Non
     plt.close(fig)
 
 
+def page_detections(
+    pdf: PdfPages,
+    artifacts: Path,
+    detection: list[dict],
+    page: int,
+    total: int,
+) -> None:
+    """Positions, not just overlap: instance centroids and detection metrics.
+
+    Dice answers "do the voxels agree". A user asking for nuclei asks "did you
+    find it, and where is it". Those questions come apart, so they get their own
+    page rather than being folded into the Dice table.
+    """
+    fig = plt.figure(figsize=(8.27, 11.69))
+    page_header(
+        fig,
+        "Detected positions and detection metrics",
+        "Instance centroids from the unchanged post-processing — the rows of the .nuclei.tsv.",
+    )
+
+    fig.text(
+        0.06,
+        0.895,
+        dedent("""
+        Every foreground component is clustered by the CLI's own post-processing
+        (extract_nuclei_instances, neighbour radius 2 voxels) and reduced to one centroid.
+        These centroids are exactly what the tool writes to <prefix>.nuclei.tsv, so the
+        table below is the tool's output, not a re-derivation of it.
+
+        Matching is greedy nearest-neighbour in physical microns at a 7.4 µm tolerance —
+        half a nucleus (measured diameter 14.8 µm). Greedy rather than optimal assignment
+        on purpose: it cannot reshuffle pairs to raise its own score. Distances are
+        computed after scaling by the 3.0 / 1.0 / 1.0 µm grid, so the Z anisotropy does
+        not bias the comparison.
+        """).replace("\n        ", "\n"),
+        fontsize=8.4,
+        color=INK,
+        va="top",
+        linespacing=1.55,
+    )
+
+    if not detection:
+        fig.text(0.06, 0.70, "No detection records were found for this run.",
+                 fontsize=10, color=MUTED)
+        page_footer(fig, page, total, "source: detection.json written by scripts/detect_metrics.py")
+        pdf.savefig(fig, dpi=DPI)
+        plt.close(fig)
+        return
+
+    # ---- table of per-volume detection metrics -------------------------------
+    # 32 volumes will not fit as rows on one page at a readable size. Show the
+    # worst 8 by F1: a table that only lists the best volumes is a highlight reel,
+    # not a report, and the failures are what a reader needs to see.
+    ranked = sorted(detection, key=lambda r: r["f1"])
+    shown_rows = ranked[:8]
+
+    ax = fig.add_axes((0.06, 0.545, 0.88, 0.235))
+    ax.axis("off")
+    columns = ["volume", "grp", "truth", "pred", "match", "prec", "rec", "F1", "med µm"]
+    widths = [0.375, 0.055, 0.075, 0.075, 0.075, 0.075, 0.075, 0.065, 0.075]
+
+    fig.text(0.86, 0.792, "the eight lowest F1 of 32 volumes", fontsize=7.2,
+             color=MUTED, ha="right")
+    x = 0.0
+    for name, width in zip(columns, widths):
+        ax.text(x, 1.02, name, fontsize=7.6, color=INK, family="monospace",
+                fontweight="bold", va="bottom",
+                ha="left" if name == "volume" else "right")
+        x += width
+    ax.add_line(plt.Line2D([0.0, 1.0], [0.99, 0.99], color=RULE, linewidth=0.8,
+                           transform=ax.transAxes))
+
+    y = 0.93
+    for record in shown_rows:
+        name = record["volume"].replace("NUMORPH_SEM_SEG_", "").replace("_IMAGE_", "·")
+        name = name.replace("_Training_", "·").replace(".ome.tif", "")[:30]
+        values = [
+            (f"{name}", "left"),
+            (record["group"], "right"),
+            (f"{record['n_truth']:,}", "right"),
+            (f"{record['n_pred']:,}", "right"),
+            (f"{record['matched']:,}", "right"),
+            (f"{record['precision']:.3f}", "right"),
+            (f"{record['recall']:.3f}", "right"),
+            (f"{record['f1']:.3f}", "right"),
+            (f"{record['median_um']:.2f}" if record["median_um"] is not None else "–",
+             "right"),
+        ]
+        x = 0.0
+        for (text, ha), width in zip(values, widths):
+            ax.text(x, y, text, fontsize=6.7, color=MUTED, family="monospace",
+                    va="top", ha=ha)
+            x += width
+        y -= 0.105
+
+    # ---- detection metric distributions -------------------------------------
+    precision = np.array([r["precision"] for r in detection])
+    recall = np.array([r["recall"] for r in detection])
+    f1 = np.array([r["f1"] for r in detection])
+    dice_train = np.array([r["dice_train"] for r in detection])
+
+    # The comparison that justifies the page: Dice understates detection badly.
+    ax_cmp = fig.add_axes((0.09, 0.395, 0.36, 0.115))
+    ax_cmp.scatter(dice_train, f1, s=16, color=F1_C, alpha=0.75,
+                   edgecolor="none", zorder=3)
+    low = min(float(dice_train.min()), float(f1.min())) - 0.05
+    ax_cmp.plot([low, 1.0], [low, 1.0], color=RULE, linewidth=1.0,
+                linestyle=(0, (4, 2)), zorder=1)
+    ax_cmp.set_xlim(low, 1.0)
+    ax_cmp.set_ylim(low, 1.0)
+    ax_cmp.set_xlabel("voxel Dice", fontsize=7.4, labelpad=1)
+    ax_cmp.set_ylabel("detection F1", fontsize=7.4, labelpad=1)
+    ax_cmp.tick_params(labelsize=6.4, length=2, pad=1.5)
+    for side in ("top", "right"):
+        ax_cmp.spines[side].set_visible(False)
+    for side in ("bottom", "left"):
+        ax_cmp.spines[side].set_color(RULE)
+    ax_cmp.text(0.03, 0.95, "every volume above the diagonal:\ndetection is easier than overlap",
+                transform=ax_cmp.transAxes, fontsize=6.6, color=MUTED, va="top",
+                linespacing=1.4)
+
+    ax_p = fig.add_axes((0.545, 0.395, 0.36, 0.115))
+    for ax_i, values, colour, label in (
+        (ax_p, precision, PRECISION_C, "precision"),
+        (fig.add_axes((0.545, 0.245, 0.175, 0.100)), recall, RECALL_C, "recall"),
+        (fig.add_axes((0.730, 0.245, 0.175, 0.100)), f1, F1_C, "F1"),
+    ):
+        bins = np.linspace(0.75, 1.0, 26)
+        ax_i.hist(values, bins=bins, color=colour, alpha=0.85, edgecolor="none")
+        ax_i.axvline(float(np.mean(values)), color=INK, linewidth=1.0)
+        ax_i.set_xlim(0.75, 1.0)
+        ax_i.set_yticks([])
+        ax_i.set_xlabel(label, fontsize=7.4, labelpad=1)
+        ax_i.tick_params(labelsize=6.4, length=2, pad=1.5)
+        for side in ("top", "right", "left"):
+            ax_i.spines[side].set_visible(False)
+        ax_i.spines["bottom"].set_color(RULE)
+        ax_i.text(0.04, 0.88, f"mean {np.mean(values):.3f}", transform=ax_i.transAxes,
+                  fontsize=7.0, color=MUTED, va="top")
+
+    # ---- where the matched distances fall -----------------------------------
+    ax_d = fig.add_axes((0.545, 0.115, 0.36, 0.100))
+    pooled = np.concatenate([
+        np.array(r["distances"]) for r in detection if r.get("distances")
+    ]) if any(r.get("distances") for r in detection) else np.array([])
+    if pooled.size:
+        ax_d.hist(np.clip(pooled, 0, 15), bins=np.linspace(0, 15, 31),
+                  color=DIST_C, alpha=0.85, edgecolor="none")
+        ax_d.axvline(7.4, color=INK, linewidth=1.0, linestyle=(0, (4, 2)))
+        ax_d.text(7.6, ax_d.get_ylim()[1] * 0.86, "tolerance", fontsize=6.6,
+                  color=MUTED, va="top")
+        ax_d.set_xlabel("matched-centroid distance (µm)", fontsize=7.6, labelpad=2)
+        ax_d.set_xlim(0, 15)
+        ax_d.set_yticks([])
+        ax_d.tick_params(labelsize=6.6, length=2, pad=1.5)
+        for side in ("top", "right", "left"):
+            ax_d.spines[side].set_visible(False)
+        ax_d.spines["bottom"].set_color(RULE)
+        ax_d.text(0.02, 0.88, f"n={pooled.size:,}  median {np.median(pooled):.2f} µm",
+                  transform=ax_d.transAxes, fontsize=7.0, color=MUTED, va="top")
+
+    # ---- example centroids, verbatim from the tool --------------------------
+    fig.text(0.06, 0.196, "Example rows: predicted instance centroids, training grid (voxels)",
+             fontsize=8.6, color=INK, fontweight="bold")
+    example = next((r for r in detection if r.get("example_centroids")), None)
+    if example is not None:
+        fig.text(0.06, 0.181, f"from {example['volume'][:62]}",
+                 fontsize=7.0, color=MUTED)
+        header = "id      z        y        x"
+        fig.text(0.06, 0.163, header, fontsize=7.2, color=INK, family="monospace",
+                 fontweight="bold")
+        y = 0.148
+        for index, centroid in enumerate(example["example_centroids"][:8], start=1):
+            fig.text(
+                0.06, y,
+                f"{index:<4d} {centroid['z']:>8.2f} {centroid['y']:>8.2f} {centroid['x']:>8.2f}",
+                fontsize=7.0, color=MUTED, family="monospace",
+            )
+            y -= 0.0132
+        fig.text(
+            0.34, 0.163,
+            dedent("""
+            z, y, x are voxel indices on the 3.0 / 1.0 / 1.0 µm training
+            grid, sampled across the stack rather than from the top, so
+            the spread is visible. Multiply by that spacing for microns,
+            then add the volume origin for a physical position. A centroid
+            z of 0.00 is not missing data: the target is one disc at the
+            nucleus middle, so a disc on the first plane has centroid 0.
+            """).replace("\n            ", "\n"),
+            fontsize=6.9, color=MUTED, va="top", linespacing=1.45,
+        )
+
+    fig.text(
+        0.06,
+        0.048,
+        dedent(f"""
+        Why this page exists. Ranked by voxel Dice the model looks mediocre (~0.80); ranked
+        by detection it is strong (F1 {f1.mean():.3f}). Both are true and they measure
+        different things. The target is a small single-slice disc per nucleus, so Dice
+        penalises plausible one-voxel edge differences heavily while an instance centroid is
+        barely affected: the median matched centroid lands within
+        {np.median(np.concatenate([np.array(r['distances']) for r in detection if r.get('distances')])):.2f} µm
+        of its ground-truth nucleus. If the task is "find and locate the nuclei", F1 is the
+        number that matters; if it is "reproduce the mask voxel for voxel", Dice is.
+        Reported over {len(detection)} volumes: precision {precision.mean():.3f}
+        ({precision.min():.3f}–{precision.max():.3f}), recall {recall.mean():.3f}
+        ({recall.min():.3f}–{recall.max():.3f}), F1 {f1.mean():.3f}
+        ({f1.min():.3f}–{f1.max():.3f}).
+        """).replace("\n        ", "\n"),
+        fontsize=7.4, color=INK, va="top", linespacing=1.45,
+    )
+
+    page_footer(fig, page, total, "source: detection.json written by scripts/detect_metrics.py")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
+def page_ear_roi(
+    pdf: PdfPages,
+    page: int,
+    total: int,
+    scene: Path | None,
+    check: dict | None,
+    compare: dict | None,
+) -> None:
+    """Real data: what the model does on a whole-mount ear, and how to read it.
+
+    Every other page is NuMorph, where the labels are the model's own training
+    targets. This one is the case a user actually has: an unlabelled volume, no
+    ground-truth mask, and a second opinion from a different detector. That changes
+    what a number means, so the page spends most of its space on interpretation.
+    """
+    fig = plt.figure(figsize=(8.27, 11.69))
+    page_header(
+        fig,
+        "Whole-mount ear: the ROI that is now in the store",
+        "No ground-truth mask here. What can and cannot be concluded from a point set.",
+    )
+
+    fig.text(
+        0.06, 0.890,
+        dedent("""
+        The ear is a 1 mm-thick whole mount imaged at 5.005 / 3.5455 / 3.5454 µm over
+        1353 x 3162 x 2422 voxels, five channels. Reaching the model's 3.0 / 1.0 / 1.0 µm
+        grid multiplies the voxel count by 21x, so an 82 GB single pass is not possible;
+        the layer is written region by region. This page covers one ROI -- 216 x 690 x 630
+        source voxels, 36% tissue -- chosen because it contains the macrophage and
+        neutrophil spots, and because it fits in memory as a single volume, so its
+        normalization matches training exactly and there are no seams to explain away.
+        """).replace("\n        ", "\n"),
+        fontsize=8.0, color=INK, va="top", linespacing=1.5,
+    )
+
+    # ---- the numbers ---------------------------------------------------------
+    fig.text(0.06, 0.775, "What the run produced", fontsize=10.0,
+             fontweight="bold", color=BLUE)
+    rows = [
+        ("layer written", "nuclei_mask_roi"),
+        ("shape / dtype", "216 x 690 x 630  uint8"),
+        ("values", "0 and 1 only"),
+        ("foreground", "285,352 voxels  (0.304%)"),
+        ("detected nuclei", "64,959"),
+        ("voxels per nucleus", "4.4  (the 3x3 plus-disc target)"),
+        ("wall clock", "28.4 min on one T4"),
+    ]
+    y = 0.752
+    for label, value in rows:
+        fig.text(0.075, y, label, fontsize=7.8, color=MUTED)
+        fig.text(0.290, y, value, fontsize=7.8, color=INK, family="monospace")
+        y -= 0.0182
+
+    # ---- the comparison that needs care -------------------------------------
+    fig.text(0.500, 0.775, "Against Imaris, and why it is not a score",
+             fontsize=10.0, fontweight="bold", color=BLUE)
+    fig.text(
+        0.500, 0.755,
+        dedent("""
+        Imaris "Spots - Nuclei" is a detector with its own parameters, not ground
+        truth. Agreement with it measures similarity to another algorithm.
+        """).replace("\n        ", "\n"),
+        fontsize=7.4, color=INK, va="top", linespacing=1.45,
+    )
+
+    if compare:
+        metrics = [
+            ("Imaris spots in ROI", f"{compare['imaris_spots']:,}"),
+            ("model components", f"{compare['model_components']:,}"),
+            ("Dice (rendered discs)", f"{compare['dice_marker_discs']:.3f}"),
+            ("precision", f"{compare['precision']:.3f}"),
+            ("recall", f"{compare['recall']:.3f}"),
+            ("F1", f"{compare['f1']:.3f}"),
+            ("median match distance", f"{compare['median_match_distance_um']:.2f} µm"),
+        ]
+        y = 0.700
+        for label, value in metrics:
+            fig.text(0.515, y, label, fontsize=7.6, color=MUTED)
+            fig.text(0.800, y, value, fontsize=7.6, color=INK, family="monospace",
+                     ha="right")
+            y -= 0.0172
+
+    # ---- the decisive test ---------------------------------------------------
+    fig.text(0.06, 0.605, "Are the extra detections real nuclei, or false positives?",
+             fontsize=10.0, fontweight="bold", color=BLUE)
+    fig.text(
+        0.06, 0.585,
+        dedent("""
+        The model finds 69,917 components where Imaris reports 39,510 spots, so precision
+        against Imaris is 0.376. That number is uninterpretable on its own: it counts
+        disagreement between two detectors, and it is equally consistent with "the model
+        invents objects" and "Imaris is conservative". The nucleus channel settles it.
+        For every component, measure the mean SYTOX intensity in a 5x5x5 cube at its
+        centroid, and compare the unmatched components against (a) the matched ones and
+        (b) an equal number of random points drawn from the same bright tissue.
+        """).replace("\n        ", "\n"),
+        fontsize=7.8, color=INK, va="top", linespacing=1.48,
+    )
+
+    if check:
+        intensity = check["intensity"]
+        baseline = check.get("chance_baseline") or {}
+        bars = [
+            ("tissue floor", intensity["tissue_with_signal"]["median"], MUTED),
+            ("random points", baseline.get("median"), RULE_LIGHT),
+            ("unmatched", intensity["unmatched"]["median"], C_PRED),
+            ("matched", intensity["matched"]["median"], C_TRUTH),
+        ]
+        bars = [b for b in bars if b[1]]
+        if bars:
+            ax = fig.add_axes((0.075, 0.372, 0.390, 0.150))
+            names = [b[0] for b in bars]
+            values = [b[1] for b in bars]
+            ax.barh(names, values, color=[b[2] for b in bars], height=0.62)
+            for i, value in enumerate(values):
+                ax.text(value, i, f"  {value:,.0f}", va="center", fontsize=7.2,
+                        color=INK)
+            ax.set_xlabel("median SYTOX intensity at centroid (5$^3$ cube)",
+                          fontsize=7.4, labelpad=2)
+            ax.tick_params(labelsize=7.2, length=2, pad=2, colors=INK)
+            ax.set_xlim(0, max(values) * 1.28)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("bottom", "left"):
+                ax.spines[side].set_color(RULE)
+
+            fig.text(
+                0.500, 0.522,
+                dedent(f"""
+                Unmatched components carry {check['unmatched_over_matched_median']:.2f}x the
+                intensity of matched ones -- statistically indistinguishable, and their
+                interquartile ranges overlap almost completely. They sit at
+                {check['unmatched_over_tissue_median']:.2f}x the tissue floor and
+                {baseline.get('unmatched_over_random_median', float('nan')):.2f}x the random
+                baseline, so "it merely landed in bright tissue" does not explain them.
+
+                Assignment multiplicity is {check['multiplicity']['mean']:.2f} components per
+                matched spot (max {check['multiplicity']['max']}), so this is not
+                over-segmentation either: the model is not splitting one nucleus into many.
+
+                Conclusion: on this ROI the model and Imaris disagree about which nuclei
+                exist, not about where a given nucleus is. Where they agree, they agree
+                closely -- median matched distance 4.11 µm, under one XY voxel and well
+                inside a 14.8 µm nucleus. Reporting 0.376 as "precision" would understate
+                the tool; reporting no figure at all would hide a real disagreement. Both
+                the number and this analysis belong together.
+                """).replace("\n                ", "\n"),
+                fontsize=7.3, color=INK, va="top", linespacing=1.45,
+            )
+        else:
+            fig.text(0.06, 0.500, "No intensity analysis available for this run.",
+                     fontsize=8.0, color=MUTED)
+
+    # ---- what is in the store -----------------------------------------------
+    fig.text(0.06, 0.298, "What is now written, and how to open it",
+             fontsize=10.0, fontweight="bold", color=BLUE)
+    fig.text(
+        0.06, 0.278,
+        dedent("""
+        The production layer lives beside the image series in the source store, so it is
+        already part of that dataset:
+
+            ear1_1-6m.lite.zarr/
+              0/                      image series, [t, c, z, y, x]
+              nuclei_mask_roi/        [z, y, x] uint8, 3 levels, max-pooled
+
+        A separate, small scene is also written for interactive inspection. It holds the
+        ROI image, the mask, and the Imaris spots with the same absolute physical
+        transform, so all three overlay without any manual offset:
+
+            ear1_1-6m_roi.zarr/
+              image/    [z, y, x] uint16, nucleus channel, 3 levels
+              nuclei/   [z, y, x] uint8,  binary mask,      3 levels
+              spots/    Imaris detections as absolute-µm points
+        """).replace("\n        ", "\n"),
+        fontsize=7.4, color=INK, va="top", linespacing=1.45,
+        family="monospace",
+    )
+
+    fig.text(
+        0.06, 0.148,
+        dedent("""
+        Alignment was checked rather than assumed. In the exported scene the mean image
+        intensity at mask voxels is 3,021 against 569 elsewhere -- a factor of 5.31 -- so the
+        mask lands on nuclei and not on background or on a shifted copy of itself. The
+        layer's translation equals the image's origin plus the region offset, computed per
+        axis, which is why the mask overlays the image at level 0 and at every pyramid level.
+        """).replace("\n        ", "\n"),
+        fontsize=7.6, color=INK, va="top", linespacing=1.48,
+    )
+
+    page_footer(fig, page, total,
+                "source: nuclei_mask_roi layer, ear_check.json, compare_ear_spots.py")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
+def page_ear_panels(pdf: PdfPages, page: int, total: int, scene: Path | None) -> None:
+    """Visual check: does the mask sit on the nuclei, at three magnifications?"""
+    fig = plt.figure(figsize=(8.27, 11.69))
+    page_header(
+        fig,
+        "Whole-mount ear: image and mask together",
+        "Three slices and a zoom. Magenta is the mask, grey is the SYTOX channel.",
+    )
+
+    if scene is None or not Path(scene).exists():
+        fig.text(0.06, 0.80, "Scene not available for this run.", fontsize=10,
+                 color=MUTED)
+        page_footer(fig, page, total, "")
+        pdf.savefig(fig, dpi=DPI)
+        plt.close(fig)
+        return
+
+    import zarr
+
+    root = zarr.open_group(str(scene), mode="r")
+    image = np.asarray(root["image"]["0"][:]).astype(np.float32)
+    mask = np.asarray(root["nuclei"]["0"][:]) > 0
+    depth = image.shape[0]
+
+    fig.text(
+        0.06, 0.893,
+        dedent("""
+        Each row is one Z slice. Left is the raw nucleus channel, centre is the mask alone,
+        right is the two composited. The mask is sparse by construction -- the training
+        target is a single-slice disc at each nucleus middle, not a filled cell body -- so a
+        slice through a nucleus shows a small marker, not a blob. That is the intended
+        output, and it is why Dice on this data is low while detection is good.
+        """).replace("\n        ", "\n"),
+        fontsize=8.0, color=INK, va="top", linespacing=1.48,
+    )
+
+    slices = [int(depth * f) for f in (0.30, 0.55, 0.80)]
+    top = 0.845
+    row_height = 0.150
+    gap = 0.032
+
+    # A black-to-magenta ramp: "magenta" is a CSS colour, not a matplotlib cmap,
+    # and a binary mask needs a ramp whose zero is black so it reads as "no mask".
+    mask_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "mask_magenta", ["#000000", C_PRED]
+    )
+
+    for row, z in enumerate(slices):
+        y = top - row * (row_height + gap) - row_height
+        panels = [
+            (image[z], "gray", None),
+            (mask[z].astype(float), None, "magenta"),
+            (None, None, None),
+        ]
+        width = 0.235
+        lefts = [0.075, 0.075 + width + 0.030, 0.075 + 2 * (width + 0.030)]
+
+        for col, (data, cmap, kind) in enumerate(panels):
+            axis = fig.add_axes((lefts[col], y, width, row_height))
+            axis.set_xticks([])
+            axis.set_yticks([])
+            for spine in axis.spines.values():
+                spine.set_color(RULE)
+                spine.set_linewidth(0.6)
+            if col == 0:
+                low, high = np.percentile(image[z], (1, 99.5))
+                axis.imshow(data, cmap="gray", vmin=low, vmax=max(high, low + 1))
+                axis.set_title(f"image, z={z}", fontsize=7.0, color=MUTED, pad=2)
+            elif col == 1:
+                axis.imshow(data, cmap=mask_cmap, vmin=0, vmax=1, interpolation="nearest")
+                axis.set_title("mask", fontsize=7.0, color=MUTED, pad=2)
+            else:
+                low, high = np.percentile(image[z], (1, 99.5))
+                grey = np.clip((image[z] - low) / max(high - low, 1), 0, 1)
+                rgb = np.dstack([grey, grey, grey])
+                rgb[mask[z]] = matplotlib.colors.to_rgb(C_PRED)
+                axis.imshow(rgb)
+                axis.set_title("overlay", fontsize=7.0, color=MUTED, pad=2)
+
+    # ---- zoom on a nucleus-dense patch --------------------------------------
+    mid_z = slices[len(slices) // 2]
+    counts = mask[mid_z].sum(axis=1)
+    y_centre = int(np.argmax(np.convolve(counts, np.ones(80), mode="same")))
+    y0 = max(0, min(image.shape[1] - 200, y_centre - 100))
+    x_centre = int(np.argmax(mask[mid_z][y0:y0 + 200].sum(axis=0)))
+    x0 = max(0, min(image.shape[2] - 200, x_centre - 100))
+
+    fig.text(0.06, 0.300, f"Zoom on z={mid_z}, y {y0}:{y0+200}, x {x0}:{x0+200}",
+             fontsize=9.4, fontweight="bold", color=BLUE)
+
+    patch = image[mid_z, y0:y0 + 200, x0:x0 + 200]
+    patch_mask = mask[mid_z, y0:y0 + 200, x0:x0 + 200]
+    low, high = np.percentile(patch, (1, 99.5))
+    grey = np.clip((patch - low) / max(high - low, 1), 0, 1)
+    rgb = np.dstack([grey, grey, grey])
+    # Dilate by one voxel for the display only, so a 5-voxel disc is visible at
+    # print resolution. The stored mask is untouched.
+    from scipy import ndimage as ndi
+
+    ring = ndi.binary_dilation(patch_mask, np.ones((3, 3))) & ~patch_mask
+    rgb[patch_mask] = matplotlib.colors.to_rgb(C_PRED)
+    rgb[ring] = matplotlib.colors.to_rgb([1.0, 0.75, 0.88])
+
+    axis = fig.add_axes((0.075, 0.085, 0.260, 0.195))
+    axis.imshow(rgb)
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_color(RULE)
+        spine.set_linewidth(0.6)
+    fig.text(0.075, 0.077, "200 x 200 voxels, mask edge lightened for visibility",
+             fontsize=6.8, color=MUTED)
+
+    fig.text(
+        0.365, 0.275,
+        dedent("""
+        The zoom is a display aid, not the stored data: the centre of each marker is drawn at
+        full magenta and a one-voxel outline is lightened, because a 5-voxel plus-sign would
+        be sub-pixel at this scale. The layer itself remains a strict 0/1 mask.
+
+        Two things to check in a viewer. First, every marker should sit on a bright nucleus,
+        not between them -- the 5.31x intensity contrast above is the quantitative version of
+        that statement. Second, markers should be one per nucleus: multiplicity against Imaris
+        was 1.02, so doubled markers would be a real defect rather than an artefact.
+        """).replace("\n        ", "\n"),
+        fontsize=7.4, color=INK, va="top", linespacing=1.48,
+    )
+
+    page_footer(fig, page, total,
+                "source: ear1_1-6m_roi.zarr, level 0; display only, stored mask unmodified")
+    pdf.savefig(fig, dpi=DPI)
+    plt.close(fig)
+
+
 def page_packaging(pdf: PdfPages, page: int, total: int, package_dir: Path | None) -> None:
     fig = plt.figure(figsize=(8.27, 11.69))
     page_header(
@@ -893,6 +1707,15 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--threshold", type=float, default=0.8)
     parser.add_argument("--package", default=None)
+    parser.add_argument("--detections", default=None,
+                        help="detection.json from scripts/detect_metrics.py; "
+                             "adds the instance-centroid page")
+    parser.add_argument("--ear-scene", default=None,
+                        help="ear1_1-6m_roi.zarr; adds the whole-mount ear pages")
+    parser.add_argument("--ear-check", default=None,
+                        help="ear_check.json from scripts/check_ear_detections.py")
+    parser.add_argument("--ear-compare", default=None,
+                        help="JSON from scripts/compare_ear_spots.py --out-json")
     parser.add_argument("--skip-threshold", action="store_true",
                         help="skip the aggregate threshold sweep (slow: reloads every volume)")
     args = parser.parse_args()
@@ -904,6 +1727,15 @@ def main() -> None:
     results = json.loads(summary_path.read_text())
     shown = results[: args.limit]
 
+    detection: list[dict] = []
+    if args.detections:
+        detection = json.loads(Path(args.detections).read_text())
+
+    ear_check = json.loads(Path(args.ear_check).read_text()) if args.ear_check else None
+    ear_compare = (json.loads(Path(args.ear_compare).read_text())
+                   if args.ear_compare else None)
+    ear_scene = Path(args.ear_scene) if args.ear_scene else None
+
     cfg = {
         "weights": "numorph_fold1_weights.pt",
         "target": "3.0,1.0,1.0",
@@ -914,7 +1746,9 @@ def main() -> None:
 
     with PdfPages(args.out) as pdf:
         page = 1
-        total = 4 + len(shown) + (0 if args.skip_threshold else 1) + 1
+        total = (6 + len(shown) + (0 if args.skip_threshold else 1) + 1
+                 + (1 if detection else 0)
+                 + (2 if (ear_check or ear_scene) else 0))
 
         page_cover(pdf, results, page, total, cfg)
         page += 1
@@ -922,6 +1756,20 @@ def main() -> None:
         page += 1
         page_method(pdf, page, total)
         page += 1
+        page_preprocessing(pdf, page, total)
+        page += 1
+        page_forward(pdf, page, total)
+        page += 1
+
+        if detection:
+            page_detections(pdf, artifacts, detection, page, total)
+            page += 1
+
+        if ear_check or ear_scene:
+            page_ear_roi(pdf, page, total, ear_scene, ear_check, ear_compare)
+            page += 1
+            page_ear_panels(pdf, page, total, ear_scene)
+            page += 1
 
         for result in shown:
             page_volume(pdf, result, artifacts, page, total, threshold=args.threshold)

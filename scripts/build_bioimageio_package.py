@@ -133,7 +133,8 @@ voxels is badly under-segmenting, not merely "sparse".
 The network has no concept of physical scale. It was trained on volumes resampled to
 {", ".join(f"{v:g}" for v in TARGET_VOXEL_SPACING)} um per voxel in Z, Y, X. Feeding it
 a volume at its stored sampling will produce something that looks like nuclei and is
-wrong -- measured Dice 0.11 versus 0.80 when the resampling is done, on the same data.
+wrong -- measured on the bundled example, whole-volume inference at the stored sampling
+scores input-grid Dice 0.456, while resampling to the training grid first scores 0.739.
 
 So the contract is:
 
