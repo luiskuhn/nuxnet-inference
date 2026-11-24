@@ -1,35 +1,34 @@
-"""Open the ear ROI in napari with the image, the predicted mask and Imaris spots.
+"""Open the ear ROI in napari with the image, the mask and both point sets.
 
     python open_ear_scene.py
 
-`napari ear1_1-6m_roi.zarr` opens the image and the label layer with their
-physical transform attached, but a points table is not an image, so the Imaris
-spots are skipped by the OME-Zarr plugin and have to be added explicitly. This
-script adds all three.
+Four layers: the marker channel, the predicted mask, the Imaris spots and the
+model's own instance centroids. The OME-Zarr plugin loads the first two with their
+physical transform attached, but a points table is not an image, so the points are
+added explicitly.
 
-The spots are stored in ABSOLUTE microns -- the same world frame the image
-layers produce through ``index * scale + translate``. So the points go in with
-scale (1, 1, 1) and no translation: handing them the image's scale as well would
-multiply their coordinates a second time and scatter them off the tissue. If the
-spots do appear displaced, the transform is wrong, and keeping the correction
-out of the file is what makes that visible rather than hidden.
-
-Verified: 39,510 points, 100% inside the image's world extent.
+All four share one world frame. The arrays carry ``index * scale + translate``; the
+points are stored in ABSOLUTE microns already, so they go in with scale (1, 1, 1)
+and no translation. Giving them the image's scale as well would multiply their
+coordinates a second time and scatter them off the tissue. If a point layer does
+appear displaced, the transform is wrong; keeping the correction out of the file is
+what makes that visible instead of hidden.
 """
 from pathlib import Path
 
+import napari
 import numpy as np
 import zarr
 from napari_ome_zarr import napari_get_reader
 
-SCENE = Path(__file__).parent / "ear1_1-6m_roi.zarr"
+SCENE = Path(__file__).parent.parent / "data" / "ear1_1-6m_roi.zarr"
 
 
 def build_layers(scene: Path = SCENE):
-    """Return layer specs as (kind, data, kwargs) tuples.
+    """Return napari layer specs as (kind, data, kwargs) tuples.
 
-    Kept separate from the viewer so the layer set, shapes and transforms can be
-    asserted without opening a window.
+    Separated from the viewer so it can be checked without opening a window:
+    a headless test can assert the layer count, shapes and transforms.
     """
     reader = napari_get_reader(str(scene))
     if reader is None:
@@ -43,26 +42,38 @@ def build_layers(scene: Path = SCENE):
             "scale": meta.get("scale"),
             "translate": meta.get("translate"),
         }
-        # A label layer needs a discrete colour map rather than the greyscale one.
+        # A label layer needs a discrete colour map, not the image's greyscale.
         if layer_type == "labels" or "mask" in name.lower():
             specs.append(("labels", data, kwargs))
         else:
             specs.append(("image", data, kwargs))
 
     root = zarr.open_group(str(scene), mode="r")
-    if "spots" in root:
+
+    # Two point sources, kept as separate layers. They are independent detectors, and
+    # merging them would hide exactly the agreement the scene exists to show.
+    point_layers = (
+        ("spots", "Imaris spots", "cyan"),
+        ("centroids", "model centroids", "yellow"),
+    )
+    for group, label, colour in point_layers:
+        if group not in root:
+            continue
         points = np.stack(
-            [np.asarray(root["spots"][k][:], float) for k in "zyx"], axis=1
+            [np.asarray(root[group][k][:], float) for k in "zyx"], axis=1
         )
         specs.append((
             "points",
             points,
             {
-                "name": f"Imaris spots ({len(points):,})",
-                "size": 5.0,               # microns; a nucleus is ~14.8 um across
-                "face_color": "cyan",
-                "border_color": "white",
-                "scale": (1.0, 1.0, 1.0),  # already absolute microns
+                "name": f"{label} ({len(points):,})",
+                "size": 4.0,             # microns; a nucleus is ~14.8 um across
+                "face_color": colour,
+                "border_color": "black",
+                "opacity": 0.6,
+                # Already absolute microns: giving these the image's scale too would
+                # multiply their coordinates a second time.
+                "scale": (1.0, 1.0, 1.0),
                 "translate": (0.0, 0.0, 0.0),
             },
         ))
@@ -70,8 +81,6 @@ def build_layers(scene: Path = SCENE):
 
 
 def main() -> None:
-    import napari
-
     viewer = napari.Viewer(ndisplay=3)
     adders = {"image": viewer.add_image, "labels": viewer.add_labels,
               "points": viewer.add_points}
