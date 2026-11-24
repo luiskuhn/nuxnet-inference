@@ -226,18 +226,24 @@ def predict_volume_on_training_grid(
     normalize_input: bool,
     classes: int,
     threshold: float,
+    normalization_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Resample to the training grid, then predict with a sliding window.
 
     Returns the mask on the **input** grid plus a report of the numbers a reader
     needs to judge the result: spacing actually used, tile count, foreground
     fraction and probability quantiles.
+
+    ``normalization_range`` pins the min/max used for the 0..1 stretch instead of
+    deriving it from this volume. A chunked caller passes one range for the whole
+    region so every chunk is mapped identically; see ``normalize_minmax``.
     """
     working, details = apply_training_pipeline(
         volume,
         source_voxel_size_um=source_voxel_size_um,
         target_voxel_size_um=target_voxel_size_um,
         normalize=normalize_input,
+        normalization_range=normalization_range,
     )
 
     result = sliding_window_predict(
@@ -378,6 +384,7 @@ def run_inference(
     patch_size: str | None = None,
     overlap: float = 0.5,
     threshold: float = 0.5,
+    normalization_range: str | None = None,
 ) -> None:
     print("[bold blue]nuxnet-pred")
     configure_reproducibility(seed=seed, deterministic=deterministic)
@@ -395,6 +402,10 @@ def run_inference(
     )
 
     tiled = target_voxel_spacing is not None or patch_size is not None
+    shared_range = (
+        _parse_pair(normalization_range, "normalization-range")
+        if normalization_range else None
+    )
     if tiled:
         target = (
             _parse_triplet(target_voxel_spacing, "target-voxel-spacing")
@@ -410,6 +421,12 @@ def run_inference(
             f"[bold cyan]Training-grid inference:[/bold cyan] target {target} um, "
             f"patch {patch}, overlap {overlap}, threshold {threshold}"
         )
+        if shared_range is not None:
+            print(
+                f"[bold cyan]normalization:[/bold cyan] pinned range "
+                f"{shared_range[0]:g}..{shared_range[1]:g} "
+                f"(not derived from this volume)"
+            )
     else:
         target, patch = DEFAULT_TARGET_VOXEL_SIZE_UM, DEFAULT_PATCH_SIZE
         print(
@@ -437,6 +454,7 @@ def run_inference(
                 normalize_input=normalize_input,
                 classes=classes,
                 threshold=threshold,
+                normalization_range=shared_range,
             )
             for key in (
                 "source_voxel_size_um",
@@ -469,6 +487,24 @@ def run_inference(
                 radius=neighbor_radius,
             )
             write_instances_tsv(instances=instances, output_prefix=output_prefix)
+
+
+def _parse_pair(value: str, option: str) -> tuple[float, float]:
+    """Parse a ``low,high`` option, requiring low < high."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2:
+        raise click.ClickException(
+            f"--{option} must be two comma-separated values, got '{value}'"
+        )
+    try:
+        low, high = (float(p) for p in parts)
+    except ValueError as exc:
+        raise click.ClickException(f"--{option} must be numeric, got '{value}'") from exc
+    if not high > low:
+        raise click.ClickException(
+            f"--{option} needs low < high, got '{value}'"
+        )
+    return low, high
 
 
 def _parse_triplet(value: str, option: str, integer: bool = False) -> tuple:
@@ -599,6 +635,17 @@ def main(ctx: click.Context) -> None:
     type=float,
     help="Foreground probability threshold; only used with --patch-size.",
 )
+@click.option(
+    "--normalization-range",
+    default=None,
+    type=str,
+    metavar="LOW,HIGH",
+    help=(
+        "Pin the min/max used for the 0..1 input stretch instead of deriving it from "
+        "this volume. A chunked run must pass one range for the whole region, or the "
+        "same tissue gets different contrast depending on which chunk it fell in."
+    ),
+)
 def predict(
     input_path: str | None,
     model_path: str | None,
@@ -619,6 +666,7 @@ def predict(
     patch_size: str | None,
     overlap: float,
     threshold: float,
+    normalization_range: str | None,
 ) -> None:
     """Run inference from provided input volumes or generated random input."""
     run_inference(
@@ -641,6 +689,7 @@ def predict(
         patch_size=patch_size,
         overlap=overlap,
         threshold=threshold,
+        normalization_range=normalization_range,
     )
 
 

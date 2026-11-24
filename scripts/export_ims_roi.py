@@ -28,6 +28,25 @@ the OME XML for this file, so the extent is the only calibration available.
 Points are already in the file's absolute microns, and the crop's translation is
 computed the same way as the mask's elsewhere in this repo --
 ``physical = index * scale + translation`` -- so the two agree by construction.
+
+Sizing
+------
+Work out the crop budget before reading anything, because these files are large
+enough that a wrong choice fills a disk mid-write. For the TE24 ear (5 channels,
+0.975/0.975/4.0 um, measured 1.65-1.71x zstd-5):
+
+    option                box (z,y,x)          vox/ch    disk
+    small test            200 x  700 x  700    0.10 G   0.6 GB
+    shipped               350 x 1200 x 1200    0.50 G   3.0 GB
+    all Z, 2.5x YX        950 x 1750 x 1750    2.91 G  17.6 GB
+    true 5x YX, all Z     950 x 3500 x 3500   11.64 G   ~70 GB
+
+Z is often the binding axis: this image has 950 slices, so "5x on every axis"
+from a 200-slice crop is impossible and the volume ratio is the honest target.
+
+The model takes exactly one input channel (the shipped checkpoint's first conv is
+(32, 1, 3, 3, 3)), so a crop only needs the channel being segmented. Dropping the
+other four cuts the on-disk cost by 5x.
 """
 
 from __future__ import annotations
@@ -203,9 +222,12 @@ def main() -> None:
     parser.add_argument(
         "--points-shift-um", default="0,0,0",
         help=(
-            "Z,Y,X offset in um added to every point before it is written. Default is "
-            "no offset: the point annotations are copied exactly as the file stores "
-            "them."
+            "Z,Y,X offset in um added to every point before it is written. Leave at "
+            "the default: the point sets in this file are already registered to the "
+            "pixels. Verified on the exported scene -- CD8, OT1 and Ki67 each score "
+            "highest on the channel they are named after (5.8x, 14.8x, 9.7x random "
+            "baseline, rank 1 of 5), which a real frame offset would break. This "
+            "exists only for files where that check fails."
         ),
     )
     args = parser.parse_args()
