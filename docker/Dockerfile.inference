@@ -1,0 +1,19 @@
+# Inference image for nuxnet-inference, built on the training image so the
+# architecture and the torch build are identical to what produced the checkpoint.
+#
+# The training image carries torch, tifffile, networkx, click and rich but not
+# scikit-image, which the nuclei instance post-processing needs for measure.label.
+# Installing it here keeps the training image untouched and reproducible.
+FROM nuxnet-training:local
+
+RUN python -m pip install --no-cache-dir "scikit-image==0.24.0" "scipy==1.13.1"
+
+# zarr is only needed by scripts/predict_zarr_chunks.py, not by the CLI itself.
+# Pinned below 3.x on purpose: OME-Zarr stores written by bioformats2raw are
+# zarr_format 2, which zarr 2.x reads natively. zarr 3 requires the new codec API
+# (zarr.codecs.Blosc) and silently changes how chunk keys are addressed.
+RUN python -m pip install --no-cache-dir "zarr==2.18.7"
+
+WORKDIR /work
+ENV PYTHONPATH=/work
+CMD ["python", "-c", "import skimage, torch; print('inference image ready', torch.__version__)"]

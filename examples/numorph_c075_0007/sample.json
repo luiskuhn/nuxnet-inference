@@ -1,0 +1,40 @@
+{
+  "image_shape_zyx": [
+    64,
+    224,
+    224
+  ],
+  "image_dtype": "float32",
+  "image_value_range": [
+    0.0,
+    1.0
+  ],
+  "mask_dtype": "uint8",
+  "mask_unique_values": [
+    0,
+    1
+  ],
+  "voxel_size_um_zyx": [
+    2.5,
+    0.75,
+    0.75
+  ],
+  "foreground_percent": 1.3222,
+  "mask_components": 680,
+  "component_size_voxels": {
+    "min": 1,
+    "median": 63.0,
+    "max": 134
+  },
+  "component_z_thickness": {
+    "min": 1,
+    "median": 1.0,
+    "max": 2
+  },
+  "source": {
+    "dataset": "NuMorph semantic segmentation (NUMORPH_SEM_SEG_DATASET)",
+    "original_image_name": "NUMORPH_SEM_SEG_C075_0007_IMAGE_c0203_Training_Bottom3_00x03.ome.tif",
+    "original_mask_name": "NUMORPH_SEM_SEG_C075_0007_MASK_c0203_Training_Bottom3_00x03.ome.tif",
+    "transform": "zlib-compressed, voxels unchanged"
+  }
+}

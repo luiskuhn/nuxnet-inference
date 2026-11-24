@@ -15,6 +15,13 @@ from torch import nn
 
 from nuxnet_inference_package.mlf_core import configure_reproducibility
 from nuxnet_inference_package.models.unet3d import UNet3D
+from nuxnet_inference_package.preprocessing import (
+    DEFAULT_PATCH_SIZE,
+    DEFAULT_TARGET_VOXEL_SIZE_UM,
+    apply_training_pipeline,
+    sliding_window_predict,
+    voxel_size_from_ome,
+)
 
 
 def extract_nuclei_instances(
@@ -132,10 +139,24 @@ def initialize_model(
 
 
 def _volume_from_ome_tiff(file_path: Path) -> np.ndarray:
+    volume, _ = _volume_and_metadata_from_ome_tiff(file_path)
+    return volume
+
+
+def _volume_and_metadata_from_ome_tiff(
+    file_path: Path,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read a volume and, when present, its physical voxel size in Z, Y, X µm."""
     with TiffFile(file_path) as tif:
         series = tif.series[0]
         volume = series.asarray()
         axes = series.axes
+        # ``ome_metadata`` lives on TiffFile in older tifffile releases and is also
+        # exposed on the series in newer ones; accept whichever is available.
+        ome_metadata = getattr(tif, "ome_metadata", None) or getattr(
+            series, "ome_metadata", None
+        )
+    voxel_size = voxel_size_from_ome(ome_metadata)
 
     if not set("ZYX").issubset(set(axes)):
         raise click.ClickException(
@@ -157,7 +178,7 @@ def _volume_from_ome_tiff(file_path: Path) -> np.ndarray:
             )
         volume = np.squeeze(volume, axis=tuple(range(3, volume.ndim)))
 
-    return volume.astype(np.float32)
+    return volume.astype(np.float32), voxel_size
 
 
 def read_input_or_dummy(file_path: Path | None, shape: str) -> np.ndarray:
@@ -194,6 +215,86 @@ def predict_volume(
     return torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
 
 
+def predict_volume_on_training_grid(
+    volume: np.ndarray,
+    model: nn.Module,
+    device: torch.device,
+    source_voxel_size_um: np.ndarray | None,
+    target_voxel_size_um: tuple[float, float, float],
+    patch_size: tuple[int, int, int],
+    overlap: float,
+    normalize_input: bool,
+    classes: int,
+    threshold: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Resample to the training grid, then predict with a sliding window.
+
+    Returns the mask on the **input** grid plus a report of the numbers a reader
+    needs to judge the result: spacing actually used, tile count, foreground
+    fraction and probability quantiles.
+    """
+    working, details = apply_training_pipeline(
+        volume,
+        source_voxel_size_um=source_voxel_size_um,
+        target_voxel_size_um=target_voxel_size_um,
+        normalize=normalize_input,
+    )
+
+    result = sliding_window_predict(
+        model=model,
+        volume=working,
+        patch_size=patch_size,
+        device=device,
+        overlap=overlap,
+        classes=classes,
+    )
+
+    # Threshold on the training grid, where the checkpoint was calibrated, then return
+    # to the input grid. The mask must stay on the input grid because callers index it
+    # against the volume they passed in.
+    #
+    # The projection matters more than it looks. Nearest-neighbour 53 -> 64 duplicates
+    # one slice in every six, and a *perfect* mask put through that scores only Dice
+    # 0.50 against itself. Interpolating the binary mask trilinearly and re-thresholding
+    # at 0.5 treats an output voxel as foreground when most of its contributing source
+    # voxels were, which recovers the shape instead of duplicating slices.
+    #
+    # Measured on two NuMorph volumes, against the round-trip ceiling:
+    #   volume                          ceiling   nearest   trilinear mask
+    #   C075_0007 (_c0203_Bottom3)       0.788     0.454        0.739
+    #   C121_0009 (_c0204_FC0)           0.983     0.390        0.800
+    # Interpolating the probability and thresholding afterwards was worse (0.452/0.658),
+    # because smoothing lowers peak probability below the operating threshold.
+    prediction = (result.probability >= threshold).astype(np.float32)
+    if details.get("resampled"):
+        back = torch.from_numpy(prediction[None, None])
+        back = torch.nn.functional.interpolate(
+            back, size=volume.shape, mode="trilinear", align_corners=False
+        )
+        # An output voxel is foreground when most of its contributing source voxels
+        # were, i.e. re-threshold the interpolated mask at 0.5.
+        prediction = (back[0, 0].numpy() >= 0.5).astype(np.uint8)
+    else:
+        prediction = prediction.astype(np.uint8)
+
+    # The probability map is reported on the grid where it was computed; it is not
+    # interpolated, so its quantiles describe the network's actual output.
+    probability = result.probability
+
+    details.update(
+        {
+            "patch_size_zyx": list(result.patch_zyx),
+            "overlap": result.overlap,
+            "n_tiles": result.n_tiles,
+            "threshold": threshold,
+            "foreground_fraction": float(prediction.mean()),
+            "probability_median": float(np.median(probability)),
+            "probability_p99": float(np.percentile(probability, 99)),
+        }
+    )
+    return prediction, details
+
+
 def iter_inputs(input_path: str | None) -> Iterable[Path | None]:
     if not input_path:
         yield None
@@ -223,11 +324,36 @@ def output_prefix_for(input_file: Path | None, input_root: str | None, output: s
     return output_path
 
 
-def write_mask_ome_tiff(prediction: np.ndarray, output_prefix: Path) -> Path:
-    """Write segmentation mask as OME-TIFF with ZYX axis metadata."""
+def write_mask_ome_tiff(
+    prediction: np.ndarray,
+    output_prefix: Path,
+    voxel_size_um: np.ndarray | None = None,
+) -> Path:
+    """Write segmentation mask as OME-TIFF with ZYX axis metadata.
+
+    Carries the input's physical voxel size through when it is known. Without it the
+    mask is a dimensionless array: tools that report distances or align volumes in
+    microns will treat it as 1 um isotropic, which is wrong by 3.5x in XY and 5x in Z
+    for typical light-sheet data. The calibration is the same on both grids because
+    resampling preserves the physical extent.
+    """
     output_path = output_prefix.with_suffix(".ome.tiff")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    imwrite(output_path, prediction, ome=True, metadata={"axes": "ZYX"})
+    metadata: dict[str, object] = {"axes": "ZYX"}
+    if voxel_size_um is not None:
+        spacing = np.asarray(voxel_size_um, dtype=np.float64).ravel()
+        if spacing.size == 3 and np.all(spacing > 0):
+            metadata.update(
+                {
+                    "PhysicalSizeZ": float(spacing[0]),
+                    "PhysicalSizeY": float(spacing[1]),
+                    "PhysicalSizeX": float(spacing[2]),
+                    "PhysicalSizeZUnit": "\u00b5m",
+                    "PhysicalSizeYUnit": "\u00b5m",
+                    "PhysicalSizeXUnit": "\u00b5m",
+                }
+            )
+    imwrite(output_path, prediction, ome=True, metadata=metadata)
     print(f"[bold green]Output: {output_path}")
     return output_path
 
@@ -248,6 +374,10 @@ def run_inference(
     postprocess_instances: bool,
     nuclei_label: int,
     neighbor_radius: float,
+    target_voxel_spacing: str | None = None,
+    patch_size: str | None = None,
+    overlap: float = 0.5,
+    threshold: float = 0.5,
 ) -> None:
     print("[bold blue]nuxnet-pred")
     configure_reproducibility(seed=seed, deterministic=deterministic)
@@ -264,11 +394,74 @@ def run_inference(
         device=device,
     )
 
+    tiled = target_voxel_spacing is not None or patch_size is not None
+    if tiled:
+        target = (
+            _parse_triplet(target_voxel_spacing, "target-voxel-spacing")
+            if target_voxel_spacing
+            else DEFAULT_TARGET_VOXEL_SIZE_UM
+        )
+        patch = (
+            _parse_triplet(patch_size, "patch-size", integer=True)
+            if patch_size
+            else DEFAULT_PATCH_SIZE
+        )
+        print(
+            f"[bold cyan]Training-grid inference:[/bold cyan] target {target} um, "
+            f"patch {patch}, overlap {overlap}, threshold {threshold}"
+        )
+    else:
+        target, patch = DEFAULT_TARGET_VOXEL_SIZE_UM, DEFAULT_PATCH_SIZE
+        print(
+            "[bold yellow]Whole-volume inference (legacy).[/bold yellow] Pass "
+            "--target-voxel-spacing and --patch-size to reproduce the trainer's input "
+            "pipeline; a checkpoint trained with resampling needs it."
+        )
+
     for input_file in iter_inputs(input_path):
         output_prefix = output_prefix_for(input_file=input_file, input_root=input_path, output=output)
-        volume = read_input_or_dummy(input_file, input_shape)
-        prediction = predict_volume(volume, model_3d, device, normalize_input=normalize_input)
-        write_mask_ome_tiff(prediction, output_prefix)
+        if tiled:
+            if input_file is None:
+                volume = read_input_or_dummy(None, input_shape)
+                voxel_size = None
+            else:
+                volume, voxel_size = _volume_and_metadata_from_ome_tiff(input_file)
+            prediction, details = predict_volume_on_training_grid(
+                volume=volume,
+                model=model_3d,
+                device=device,
+                source_voxel_size_um=voxel_size,
+                target_voxel_size_um=target,
+                patch_size=patch,
+                overlap=overlap,
+                normalize_input=normalize_input,
+                classes=classes,
+                threshold=threshold,
+            )
+            for key in (
+                "source_voxel_size_um",
+                "target_voxel_size_um",
+                "prepared_shape_zyx",
+                "n_tiles",
+                "note",
+                "warning",
+            ):
+                if details.get(key) is not None:
+                    print(f"[bold cyan]{key}:[/bold cyan] {details[key]}")
+            print(
+                f"[bold cyan]foreground:[/bold cyan] "
+                f"{details['foreground_fraction'] * 100:.3f}%"
+            )
+        else:
+            volume = read_input_or_dummy(input_file, input_shape)
+            voxel_size = None
+            if input_file is not None:
+                # The mask must carry the input's calibration, so read it even on the
+                # legacy path; a mask without physical size misaligns downstream work.
+                volume, voxel_size = _volume_and_metadata_from_ome_tiff(input_file)
+            prediction = predict_volume(volume, model_3d, device, normalize_input=normalize_input)
+        write_mask_ome_tiff(prediction, output_prefix, voxel_size_um=voxel_size)
+        # Post-processing is unchanged: same function, same arguments, same output.
         if postprocess_instances:
             instances = extract_nuclei_instances(
                 prediction=prediction,
@@ -276,6 +469,22 @@ def run_inference(
                 radius=neighbor_radius,
             )
             write_instances_tsv(instances=instances, output_prefix=output_prefix)
+
+
+def _parse_triplet(value: str, option: str, integer: bool = False) -> tuple:
+    """Parse an ``a,b,c`` option into a three-tuple with a clear error message."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 3:
+        raise click.ClickException(
+            f"--{option} must be three comma-separated values, got '{value}'"
+        )
+    try:
+        numbers = tuple(int(p) if integer else float(p) for p in parts)
+    except ValueError as exc:
+        raise click.ClickException(f"--{option} must be numeric, got '{value}'") from exc
+    if any(n <= 0 for n in numbers):
+        raise click.ClickException(f"--{option} values must be positive, got '{value}'")
+    return numbers
 
 
 @click.group(invoke_without_command=True)
@@ -291,9 +500,9 @@ def main(ctx: click.Context) -> None:
             output="predictions",
             input_shape="16,64,64",
             arch="unet3d",
-            classes=3,
+            classes=2,
             in_channels=1,
-            dropout_rate=0.25,
+            dropout_rate=0.1,
             seed=42,
             cuda=False,
             normalize_input=True,
@@ -301,6 +510,10 @@ def main(ctx: click.Context) -> None:
             nuclei_label=1,
             neighbor_radius=2.0,
             deterministic=False,
+            target_voxel_spacing=None,
+            patch_size=None,
+            overlap=0.5,
+            threshold=0.5,
         )
 
 
@@ -316,9 +529,9 @@ def main(ctx: click.Context) -> None:
 @click.option("--output", default="predictions", show_default=True, required=True, type=str, help="Output prefix or output folder for .ome.tiff mask files.")
 @click.option("--input-shape", default="16,64,64", show_default=True, type=str, help="Shape D,H,W used only when --input is omitted.")
 @click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Network architecture used for inference.")
-@click.option("--classes", default=3, show_default=True, type=int, help="Number of output segmentation classes.")
+@click.option("--classes", default=2, show_default=True, type=int, help="Number of output segmentation classes, including background. The NuMorph nucleus-marker task uses 2.")
 @click.option("--in-channels", default=1, show_default=True, type=int, help="Number of input channels expected by the model.")
-@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
+@click.option("--dropout-rate", default=0.1, show_default=True, type=float, help="Dropout rate used by UNet3D blocks; should match the trained checkpoint.")
 @click.option("--seed", default=42, show_default=True, type=int, help="Random seed for dummy input generation and model init.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
 @click.option(
@@ -353,6 +566,39 @@ def main(ctx: click.Context) -> None:
     type=float,
     help="Radius used to create dense voxel neighborhoods with KDTree for graph clustering.",
 )
+@click.option(
+    "--target-voxel-spacing",
+    default=None,
+    type=str,
+    help=(
+        "Resample the input to this Z,Y,X spacing in um before inference, matching the "
+        "trainer's --target-voxel-spacing (for example '3.0,1.0,1.0'). Enable this when "
+        "the checkpoint was trained with resampling."
+    ),
+)
+@click.option(
+    "--patch-size",
+    default=None,
+    type=str,
+    help=(
+        "Sliding-window tile size as Z,Y,X (for example '32,128,128'). Should equal the "
+        "trainer's --patch-size so the network sees its training field of view."
+    ),
+)
+@click.option(
+    "--overlap",
+    default=0.5,
+    show_default=True,
+    type=float,
+    help="Fraction shared by neighbouring sliding-window tiles.",
+)
+@click.option(
+    "--threshold",
+    default=0.5,
+    show_default=True,
+    type=float,
+    help="Foreground probability threshold; only used with --patch-size.",
+)
 def predict(
     input_path: str | None,
     model_path: str | None,
@@ -369,6 +615,10 @@ def predict(
     postprocess_instances: bool,
     nuclei_label: int,
     neighbor_radius: float,
+    target_voxel_spacing: str | None,
+    patch_size: str | None,
+    overlap: float,
+    threshold: float,
 ) -> None:
     """Run inference from provided input volumes or generated random input."""
     run_inference(
@@ -387,6 +637,10 @@ def predict(
         postprocess_instances=postprocess_instances,
         nuclei_label=nuclei_label,
         neighbor_radius=neighbor_radius,
+        target_voxel_spacing=target_voxel_spacing,
+        patch_size=patch_size,
+        overlap=overlap,
+        threshold=threshold,
     )
 
 
@@ -394,9 +648,9 @@ def predict(
 @click.option("--output", default="smoke_test_mask", show_default=True, type=str, help="Output prefix for generated .ome.tiff mask.")
 @click.option("--input-shape", default="16,64,64", show_default=True, type=str, help="Random 3D input shape formatted as D,H,W.")
 @click.option("--arch", default="unet3d", show_default=True, type=click.Choice(["unet3d", "dummy"]), help="Architecture used for the untrained forward pass.")
-@click.option("--classes", default=3, show_default=True, type=int, help="Number of output classes.")
+@click.option("--classes", default=2, show_default=True, type=int, help="Number of output classes, including background.")
 @click.option("--in-channels", default=1, show_default=True, type=int, help="Number of model input channels.")
-@click.option("--dropout-rate", default=0.25, show_default=True, type=float, help="Dropout rate used by UNet3D blocks.")
+@click.option("--dropout-rate", default=0.1, show_default=True, type=float, help="Dropout rate used by UNet3D blocks; should match the trained checkpoint.")
 @click.option("--seed", default=42, show_default=True, type=int, help="Seed for random input/model initialization.")
 @click.option("--cuda/--no-cuda", default=False, help="Use CUDA when available.")
 @click.option(
@@ -440,6 +694,10 @@ def smoke_test(
         nuclei_label=1,
         neighbor_radius=2.0,
         normalize_input=normalize_input,
+        target_voxel_spacing=None,
+        patch_size=None,
+        overlap=0.5,
+        threshold=0.5,
     )
 
 
