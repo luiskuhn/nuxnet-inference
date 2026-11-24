@@ -1,12 +1,15 @@
 """Open the ear ROI in napari: marker, predicted mask, and both point sets.
 
-    python open_ear_scene.py
+    python open_ear_scene.py                 # 4 layers, the default
+    python open_ear_scene.py --all-channels   # 8 layers, every acquired channel
 
-Eight layers: the five acquired channels, the predicted mask, the Imaris spots and
-the model's own instance centroids. Only the marker channel is visible on open --
-that is the channel the model ran on, marked ``[MODEL INPUT]`` in its name -- because
-five channels added together read as a bright smear. The other four are one click
-away in the layer list.
+The default is the four things the segmentation is actually about: the marker channel
+the model ran on, the predicted mask, the Imaris spots and the model's own instance
+centroids. That is the view for asking whether the two detectors agree.
+
+``--all-channels`` adds the other four acquired channels, hidden, so the anatomy is
+one click away without being in the way: five channels blended additively read as a
+bright smear, which hides the nuclei the mask is drawn over.
 
 Two details this file has to get right, both of which were wrong once and looked
 like a broken store rather than a broken viewer:
@@ -34,8 +37,27 @@ from napari_ome_zarr import napari_get_reader
 SCENE = Path(__file__).parent.parent / "data" / "ear1_1-6m_roi.zarr"
 
 
-def build_layers(scene: Path = SCENE):
+def _take_first_level(data, keep, channel_axis):
+    """Select `keep` channels from every level of a multiscale, channel-axis array.
+
+    Indexing with a plain integer drops the axis rather than leaving a size-1
+    dimension, which matters because a leftover channel axis would make a single
+    channel a 4D array and shift the scale/translate napari pairs with it. Indexing
+    a dask array also stays lazy (measured 3.5 ms), so the trim costs nothing until a
+    slice is displayed.
+    """
+    index = [slice(None)] * data[0].ndim
+    index[channel_axis] = keep[0] if len(keep) == 1 else list(keep)
+    index = tuple(index)
+    return [level[index] for level in data]
+
+
+def build_layers(scene: Path = SCENE, all_channels: bool = False):
     """Return napari layer specs as (kind, data, kwargs) tuples.
+
+    `all_channels=False` (the default) keeps only the marker channel, giving the four
+    layers the segmentation is about: marker, mask, spots, centroids. `all_channels=True`
+    adds the remaining acquired channels as hidden layers.
 
     Separated from the viewer so it can be checked without opening a window:
     a headless test can assert the layer count, shapes and transforms.
@@ -64,18 +86,44 @@ def build_layers(scene: Path = SCENE):
         # A multi-channel image arrives as one (c, z, y, x) array with `name` a list
         # of per-channel names. napari needs `channel_axis` to split it into one layer
         # per channel; without it, add_image raises TypeError on the list-valued name.
-        if meta.get("channel_axis") is not None:
-            kwargs["channel_axis"] = meta["channel_axis"]
-            kwargs.setdefault("blending", "additive")
-            # Show the marker the model actually ran on; leave the others off so the
-            # first frame is the segmentation's own input rather than five channels
-            # of anatomy added together, which reads as a bright smear. They stay one
-            # click away in the layer list.
-            labels = meta.get("name") or []
-            if isinstance(labels, list) and labels:
-                kwargs["visible"] = ["MODEL INPUT" in str(x).upper() for x in labels]
+        channel_axis = meta.get("channel_axis")
+        if channel_axis is not None:
+            labels = list(meta.get("name") or [])
+            # Pick the marker by name, never by position: the channel order is the
+            # acquisition's, and the label is what marks which one the model saw.
+            marked = [i for i, x in enumerate(labels) if "MODEL INPUT" in str(x).upper()]
+            keep = list(range(len(labels))) if all_channels else marked[:1]
+
+            if len(keep) != len(labels):
+                # Trim the stack and every per-channel metadata list together. napari
+                # matches these positionally, so slicing only the array would attach
+                # the marker's window and colour to the wrong channel.
+                data = _take_first_level(data, keep, channel_axis)
+                for key in ("name", "contrast_limits", "colormap", "visible"):
+                    value = kwargs.get(key)
+                    if isinstance(value, list) and len(value) == len(labels):
+                        kwargs[key] = [value[i] for i in keep]
+
+            if isinstance(kwargs.get("name"), list) and len(kwargs["name"]) > 1:
+                kwargs["channel_axis"] = channel_axis
+                kwargs.setdefault("blending", "additive")
+                # Show the marker; leave the rest off so the first frame is the
+                # segmentation's own input rather than five channels of anatomy added
+                # together. They stay one click away in the layer list.
+                kwargs["visible"] = ["MODEL INPUT" in str(x).upper()
+                                     for x in kwargs["name"]]
                 if not any(kwargs["visible"]):
                     kwargs["visible"][0] = True
+            else:
+                # A single remaining channel needs no split, so drop the axis
+                # machinery entirely. Every per-channel list must be unwrapped too
+                # -- napari rejects a sequence-valued colormap without channel_axis.
+                kwargs.pop("channel_axis", None)
+                kwargs.pop("visible", None)
+                for key in ("name", "contrast_limits", "colormap"):
+                    value = kwargs.get(key)
+                    if isinstance(value, list) and len(value) == 1:
+                        kwargs[key] = value[0]
 
         # Keep ONLY the finest level. This is what makes 3D usable.
         #
@@ -96,7 +144,7 @@ def build_layers(scene: Path = SCENE):
         # Handing napari a single level makes multiscale False, so data_level is 0
         # in both 2D and 3D and every view is native. The arrays stay lazy (zarr
         # backed), so this costs nothing until a slice is read: 0.5 s / 188 MB for
-        # one channel, and only the marker starts visible.
+        # one channel.
         finest = data[0] if isinstance(data, (list, tuple)) else data
 
         # A label layer takes a discrete label->colour mapping, not an image colormap,
@@ -142,10 +190,24 @@ def build_layers(scene: Path = SCENE):
 
 
 def main() -> None:
-    viewer = napari.Viewer(ndisplay=3)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Open the ear ROI scene: marker, mask, Imaris spots, model "
+                    "centroids (4 layers). Add --all-channels for the other four "
+                    "acquired channels."
+    )
+    parser.add_argument("--all-channels", action="store_true",
+                        help="also load the four non-marker channels, hidden; "
+                             "default is marker + mask + spots + centroids")
+    parser.add_argument("--2d", dest="two_d", action="store_true",
+                        help="open in 2D instead of 3D")
+    args = parser.parse_args()
+
+    viewer = napari.Viewer(ndisplay=2 if args.two_d else 3)
     adders = {"image": viewer.add_image, "labels": viewer.add_labels,
               "points": viewer.add_points}
-    for kind, data, kwargs in build_layers():
+    for kind, data, kwargs in build_layers(all_channels=args.all_channels):
         adders[kind](data, **kwargs)
     napari.run()
 

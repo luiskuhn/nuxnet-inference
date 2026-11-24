@@ -270,7 +270,7 @@ def test_viewer_helpers_keep_the_stored_contrast_window(tmp_path):
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
 
-    specs = helper.build_layers(store)
+    specs = helper.build_layers(store, all_channels=True)
     images = [kw for kind_, _, kw in specs if kind_ == "image"]
     assert len(images) == 1
     assert images[0]["contrast_limits"] == [[0, 400], [0, 900]], (
@@ -347,3 +347,95 @@ def test_viewer_helpers_show_the_finest_level_in_both_2d_and_3d(tmp_path):
             assert layer.data.shape == (8, 16, 16), (
                 f"ndisplay={ndisplay}: showed {layer.data.shape}, not the finest level"
             )
+
+
+def test_default_view_is_marker_mask_and_both_point_sets(tmp_path):
+    """The default is 4 layers; --all-channels adds the rest, hidden.
+
+    Requested behaviour: open the marker, the mask, the Imaris spots and the model
+    centroids, nothing else, so the two detectors can be compared without four extra
+    anatomy channels in the way. The extra channels must remain available, but they
+    must not be dropped by accident either -- which is what a positional channel
+    slice does when the marker is not channel 0.
+    """
+    pytest.importorskip("napari")
+    import pathlib
+
+    import numpy as np
+    from napari.components import ViewerModel
+    from numcodecs import Blosc
+    from scripts.export_roi_scene import open_store, write_group
+
+    store = tmp_path / "scene.zarr"
+    group = open_store(store, mode="w")
+    # Marker deliberately NOT first, to catch a positional rather than by-name pick.
+    data = np.zeros((2, 8, 16, 16), np.uint16)
+    data[0, :, :8, :8] = 500          # Veins
+    data[1, :, 2:6, 2:6] = 3000       # Nuclei [MODEL INPUT]
+    write_group(
+        group, None, [data], (5.0, 3.5, 3.5), (0.0, 0.0, 0.0),
+        [(5.0, 3.5, 3.5)], "FFFFFF", "nuclei",
+        compressor=Blosc(cname="zstd", clevel=5, shuffle=0),
+        channel_labels=["Veins", "Nuclei [MODEL INPUT]"],
+        channel_colours=["FF0605", "05FF02"],
+        channel_windows=[(0.0, 500.0), (0.0, 3000.0)],
+    )
+    root = open_store(store, mode="a")
+    labels = root.require_group("labels")
+    labels.attrs["labels"] = ["nuclei"]
+    import numpy as np2
+    mask = np.zeros((8, 16, 16), np.uint8)
+    mask[:, 2:6, 2:6] = 1
+    node = labels.require_group("nuclei")
+    node.create_dataset("0", data=mask, chunks=(8, 16, 16), overwrite=True,
+                        dimension_separator="/")
+    # The exporter writes multiscales for the label group too; without it the reader
+    # does not offer the mask as a layer at all.
+    node.attrs["multiscales"] = [{
+        "version": "0.4", "name": "nuclei",
+        "axes": [{"name": a, "type": "space", "unit": "micrometer"}
+                 for a in ("z", "y", "x")],
+        "datasets": [{"path": "0", "coordinateTransformations": [
+            {"type": "scale", "scale": [5.0, 3.5, 3.5]},
+            {"type": "translation", "translation": [0.0, 0.0, 0.0]}]}],
+    }]
+    node.attrs["omero"] = {"channels": [{"color": "FF00FF", "label": "nuclei mask",
+                                        "window": {"start": 0, "end": 1,
+                                                   "min": 0, "max": 1}}]}
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "scene_helper", pathlib.Path(__file__).parent.parent / "open_ear_scene.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    counts = {}
+    for all_channels in (False, True):
+        v = ViewerModel(ndisplay=3)
+        for kind, payload, kwargs in helper.build_layers(store, all_channels=all_channels):
+            {"image": v.add_image, "labels": v.add_labels,
+             "points": v.add_points}[kind](payload, **kwargs)
+        images = [l for l in v.layers if type(l).__name__ == "Image"]
+        counts[all_channels] = (len(v.layers), images)
+
+    # Default: one image (the marker). The synthetic store has no spots/centroids
+    # groups, so the total is mask + that image.
+    n_default, images_default = counts[False]
+    assert n_default == 2, f"expected mask + 1 image, got {n_default} layers"
+    assert len(images_default) == 1
+    marker = images_default[0]
+    assert marker.data.shape == (8, 16, 16), (
+        f"a size-1 channel axis would leave 4D data, got {marker.data.shape}"
+    )
+    # The marker is the bright square at 2:6, not the dimmer half-plane.
+    assert int(np.asarray(marker.data).max()) == 3000, (
+        "kept the wrong channel: the marker must be chosen by name, not position"
+    )
+    assert np.asarray(marker.data)[0, 0, 0] == 0
+
+    # --all-channels: both channels, only the marker visible.
+    n_all, images_all = counts[True]
+    assert n_all == 3, f"expected mask + 2 images, got {n_all} layers"
+    assert len(images_all) == 2
+    visible = [l.name for l in images_all if l.visible]
+    assert len(visible) == 1 and "MODEL INPUT" in visible[0].upper()
